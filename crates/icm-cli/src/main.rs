@@ -5071,6 +5071,43 @@ Do this BEFORE responding to the user. Not optional.
         } else {
             println!("[skill] {:<16} skipped (not detected)", "Pi");
         }
+
+        // OpenCode: https://opencode.ai/docs/skills/
+        // OpenCode skills require YAML frontmatter with name and description.
+        let opencode_skills_base = PathBuf::from(&home).join(".config/opencode/skills");
+        if force || detect_tool("OpenCode", &home, &vscode_data) {
+            let mut install = |name: &str, prompt: &str| -> Result<()> {
+                let skill_dir = opencode_skills_base.join(format!("icm-{name}"));
+                let skill_path = skill_dir.join("SKILL.md");
+                if let Ok(e) = install_manifest::InstallManifest::entry_from_disk(
+                    &skill_path,
+                    "OpenCode skill",
+                    install_manifest::EntryKind::OwnedFile,
+                ) {
+                    manifest.record(e);
+                }
+                let content = format!(
+                    "\
+---
+name: icm-{name}
+description: ICM persistent memory — /{name}
+---
+
+{prompt}"
+                );
+                install_skill(
+                    &skill_dir,
+                    "SKILL.md",
+                    &content,
+                    &format!("OpenCode /icm-{name}"),
+                )
+            };
+            install("recall", icm_recall_prompt)?;
+            install("remember", icm_remember_prompt)?;
+            install("remember-session", icm_remember_session_prompt)?;
+        } else {
+            println!("[skill] {:<16} skipped (not detected)", "OpenCode");
+        }
     }
 
     // --- Hook mode: install hooks for each detected tool ---

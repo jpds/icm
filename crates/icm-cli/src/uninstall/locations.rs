@@ -381,6 +381,28 @@ pub(crate) fn build_locations(d: &DirContext) -> Vec<LocationSpec> {
         kind: K::OwnedFile,
         purge_data_only: false,
     });
+    let opencode_skills: &[(&str, &str)] = &[
+        (
+            "OpenCode /icm-recall",
+            ".config/opencode/skills/icm-recall/SKILL.md",
+        ),
+        (
+            "OpenCode /icm-remember",
+            ".config/opencode/skills/icm-remember/SKILL.md",
+        ),
+        (
+            "OpenCode /icm-remember-session",
+            ".config/opencode/skills/icm-remember-session/SKILL.md",
+        ),
+    ];
+    for (label, rel) in opencode_skills {
+        specs.push(LocationSpec {
+            label,
+            path: d.home.join(rel),
+            kind: K::OwnedFile,
+            purge_data_only: false,
+        });
+    }
 
     // --- Amp (dotted servers key + skills) ---
     specs.push(LocationSpec {
@@ -550,6 +572,9 @@ mod tests {
             "Zed MCP",
             "OpenCode MCP",
             "OpenCode plugin",
+            "OpenCode /icm-recall",
+            "OpenCode /icm-remember",
+            "OpenCode /icm-remember-session",
             "Amp MCP",
             "Amp /icm-recall",
             "Amp /icm-remember",
