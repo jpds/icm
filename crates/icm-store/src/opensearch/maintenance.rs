@@ -4,9 +4,7 @@
 
 use super::*;
 
-// ---------------------------------------------------------------------------
 // Inherent methods used by the cli/mcp store/recall/hook path
-// ---------------------------------------------------------------------------
 
 impl OpenSearchStore {
     pub fn maybe_auto_decay(&self) -> IcmResult<()> {

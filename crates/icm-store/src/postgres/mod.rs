@@ -51,13 +51,9 @@ use icm_core::{
 // backend can be compiled into one binary without colliding definitions.
 pub use crate::common::{CodeArea, HookEvent, HookEventInsert, HookStatsRow, PendingRow};
 
-// ---------------------------------------------------------------------------
 // Helpers (mirrored from the SQLite backend so behaviour matches)
-// ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
 // PostgresStore
-// ---------------------------------------------------------------------------
 
 /// PostgreSQL-backed store. See the module docs.
 pub struct PostgresStore {

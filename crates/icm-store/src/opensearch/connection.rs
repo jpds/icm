@@ -266,7 +266,7 @@ impl OpenSearchStore {
         Ok(())
     }
 
-    // --- metadata kv helpers ---
+    // metadata kv helpers
 
     pub(crate) fn get_metadata_int(&self, key: &str) -> IcmResult<Option<i64>> {
         let path = format!("{IDX_METADATA}/_doc/{key}");

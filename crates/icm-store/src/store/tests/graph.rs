@@ -182,7 +182,7 @@ fn test_expand_with_neighbors_skips_missing_targets() {
     assert_eq!(expanded.len(), 1, "ghost link must be silently skipped");
 }
 
-// ── get_many (batched fetch) ─────────────────────────────────────────
+// get_many (batched fetch)
 
 #[test]
 fn test_get_many_returns_requested_ids() {
@@ -231,7 +231,7 @@ fn test_get_many_dedupes_input() {
     assert_eq!(got.len(), 1);
 }
 
-// ── LRU cache invalidation ────────────────────────────────────────────
+// LRU cache invalidation
 
 #[test]
 fn test_cache_serves_after_first_get() {
@@ -336,7 +336,7 @@ fn test_get_many_uses_cache_for_warm_ids() {
     assert_eq!(got.get(&id).unwrap().summary, "warm");
 }
 
-// ── content-hash dedup ───────────────────────────────────────────────
+// content-hash dedup
 
 #[test]
 fn test_dedup_same_topic_summary_collapses() {

@@ -5,9 +5,7 @@
 //! coherent group of inherent methods) on that type.
 
 use super::*;
-// ---------------------------------------------------------------------------
 // Memory helpers
-// ---------------------------------------------------------------------------
 
 pub(crate) fn source_type(source: &MemorySource) -> &'static str {
     match source {
@@ -192,9 +190,7 @@ pub(crate) fn is_fts5_syntax_error(e: &rusqlite::Error) -> bool {
     )
 }
 
-// ---------------------------------------------------------------------------
 // MemoryStore impl
-// ---------------------------------------------------------------------------
 
 /// Maximum byte length of a stored summary. Audit finding: a transcript
 /// containing a 1 MB unbroken text block landed as a single memory whose

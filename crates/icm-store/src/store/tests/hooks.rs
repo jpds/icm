@@ -2,7 +2,7 @@
 
 use super::*;
 
-// ── Hook telemetry ─────────────────────────────────────────────────
+// Hook telemetry
 
 #[test]
 fn test_record_hook_event_persists() {
@@ -80,7 +80,7 @@ fn test_prune_hook_events_drops_old_rows_only() {
     assert_eq!(store.hook_event_count().unwrap(), 1);
 }
 
-// ── code_areas (issue #196) ────────────────────────────────────────
+// code_areas (issue #196)
 
 #[test]
 fn test_upsert_code_area_inserts_then_increments_touch_count() {

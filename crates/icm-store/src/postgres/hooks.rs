@@ -32,7 +32,7 @@ impl PostgresStore {
         Ok(())
     }
 
-    // ── Async extraction queue ─────────────────────────────────────────
+    // Async extraction queue
 
     /// Enqueue raw tool output for later LLM extraction.
     pub fn enqueue_pending_extraction(
@@ -105,7 +105,7 @@ impl PostgresStore {
         Ok(n.max(0) as usize)
     }
 
-    // ── Code areas (issue #196) ────────────────────────────────────────
+    // Code areas (issue #196)
 
     /// Insert or refresh a row for `(project, file_path)`.
     pub fn upsert_code_area(
@@ -208,7 +208,7 @@ impl PostgresStore {
         Ok(n.max(0) as usize)
     }
 
-    // ── Hook telemetry ─────────────────────────────────────────────────
+    // Hook telemetry
 
     /// Append one hook telemetry row, returning its id.
     pub fn record_hook_event(&self, ev: &HookEventInsert) -> IcmResult<i64> {

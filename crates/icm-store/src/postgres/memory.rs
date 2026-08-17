@@ -2,9 +2,7 @@
 
 use super::*;
 
-// ---------------------------------------------------------------------------
 // MemoryStore
-// ---------------------------------------------------------------------------
 
 impl MemoryStore for PostgresStore {
     fn store(&self, memory: Memory) -> IcmResult<String> {
@@ -517,10 +515,8 @@ impl MemoryStore for PostgresStore {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Unsupported subsystems on this backend (first cut, issue #301).
 //
 // These return `IcmError::Unsupported` so the binary keeps working for the
 // core shared-memory use case while the heavier subsystems remain on the
 // default SQLite backend. A follow-up can port them.
-// ---------------------------------------------------------------------------

@@ -46,9 +46,7 @@ use icm_core::{
 // backend can be compiled into one binary without colliding definitions.
 pub use crate::common::{CodeArea, HookEvent, HookEventInsert, HookStatsRow, PendingRow};
 
-// ---------------------------------------------------------------------------
 // Index names
-// ---------------------------------------------------------------------------
 
 const IDX_MEMORIES: &str = "icm_memories";
 const IDX_METADATA: &str = "icm_metadata";
@@ -57,7 +55,6 @@ const IDX_PENDING: &str = "icm_pending_extractions";
 const IDX_CODE_AREAS: &str = "icm_code_areas";
 
 // Store
-// ---------------------------------------------------------------------------
 
 /// OpenSearch-backed store. Cheap to clone-free share via `&self`; every
 /// method is a blocking REST round-trip.
@@ -69,10 +66,8 @@ pub struct OpenSearchStore {
     readonly: bool,
 }
 
-// ---------------------------------------------------------------------------
 // Subsystems not yet ported to this backend. They stay fully available on
 // the default SQLite backend; here they fail cleanly with `Unsupported`.
-// ---------------------------------------------------------------------------
 
 fn unsupported<T>(op: &str) -> IcmResult<T> {
     Err(IcmError::Unsupported(format!(

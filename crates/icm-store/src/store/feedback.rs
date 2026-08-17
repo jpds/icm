@@ -33,9 +33,7 @@ const FEEDBACK_COLS: &str =
 const FEEDBACK_COLS_F: &str = "f.id, f.topic, f.context, f.predicted, f.corrected, f.reason, \
      f.source, f.created_at, f.applied_count, f.embedding";
 
-// ---------------------------------------------------------------------------
 // FeedbackStore impl
-// ---------------------------------------------------------------------------
 
 /// Pure Rust cosine similarity for the feedback semantic fallback (no
 /// vec0 virtual table — feedback volume is expected far lower than

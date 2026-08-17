@@ -33,7 +33,7 @@ impl SqliteStore {
         Ok(())
     }
 
-    // ── Async extraction queue ─────────────────────────────────────────
+    // Async extraction queue
     //
     // Row tuple shape: `(id, project, tool_name, raw_output, captured_at)`
     //
@@ -112,7 +112,7 @@ impl SqliteStore {
         Ok(n as usize)
     }
 
-    // ── Code areas (auto-captured file edits — issue #196) ────────────
+    // Code areas (auto-captured file edits — issue #196)
     //
     // `cmd_hook_post` calls `upsert_code_area` whenever the upstream
     // tool was Edit / Write / MultiEdit / NotebookEdit. Same project +
@@ -226,7 +226,7 @@ impl SqliteStore {
         Ok(n as usize)
     }
 
-    // ── Hook telemetry ─────────────────────────────────────────────────
+    // Hook telemetry
     //
     // Every `icm hook <event>` fire writes one row to `hook_events`. Read
     // back via `hook_events_recent` / `hook_stats`. Inserts are designed

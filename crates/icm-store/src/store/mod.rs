@@ -408,9 +408,7 @@ impl SqliteStore {
         Ok(memory.id.clone())
     }
 }
-// ---------------------------------------------------------------------------
 // Test helpers (visible to other modules in crate for test use)
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 pub(crate) mod test_helpers {

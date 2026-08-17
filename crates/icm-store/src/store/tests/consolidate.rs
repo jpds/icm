@@ -121,4 +121,4 @@ fn test_get_by_topic_prefix() {
     assert_eq!(results.len(), 2);
 }
 
-// ── expand_with_neighbors ────────────────────────────────────────────
+// expand_with_neighbors

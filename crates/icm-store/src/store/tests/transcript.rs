@@ -290,4 +290,4 @@ fn test_transcript_messages_chronological() {
     assert_eq!(got, ids);
 }
 
-// ── Hook telemetry ─────────────────────────────────────────────────
+// Hook telemetry

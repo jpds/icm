@@ -5,7 +5,7 @@
 use super::*;
 
 impl PostgresStore {
-    // ── Memory reads used by recall expansion ──────────────────────────
+    // Memory reads used by recall expansion
 
     /// Fetch many memories by id in one round-trip, deduplicated by id.
     pub fn get_many(&self, ids: &[&str]) -> IcmResult<HashMap<String, Memory>> {
@@ -125,7 +125,7 @@ impl PostgresStore {
             .collect())
     }
 
-    // ── Consolidation / patterns ───────────────────────────────────────
+    // Consolidation / patterns
 
     /// Auto-consolidation is not yet implemented on the PostgreSQL
     /// backend; the call is a no-op (returns "did not consolidate") so the

@@ -24,9 +24,7 @@ pub(crate) fn url_encode_path_segment(s: &str) -> String {
     out
 }
 
-// ---------------------------------------------------------------------------
 // Pure helpers (self-contained, mirror the other backends)
-// ---------------------------------------------------------------------------
 
 pub(crate) fn source_type(source: &MemorySource) -> &'static str {
     match source {
@@ -109,10 +107,8 @@ pub(crate) fn parse_dt(s: &str) -> DateTime<Utc> {
         .unwrap_or_else(|_| Utc::now())
 }
 
-// ---------------------------------------------------------------------------
-
 impl OpenSearchStore {
-    // --- (de)serialization ---
+    // (de)serialization
 
     pub(crate) fn memory_to_source(memory: &Memory) -> Value {
         let mut doc = json!({

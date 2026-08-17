@@ -60,12 +60,10 @@ fn row_to_link(row: &rusqlite::Row) -> rusqlite::Result<ConceptLink> {
 
 const LINK_COLS: &str = "id, source_id, target_id, relation, weight, created_at";
 
-// ---------------------------------------------------------------------------
 // MemoirStore impl
-// ---------------------------------------------------------------------------
 
 impl MemoirStore for SqliteStore {
-    // --- Memoir CRUD ---
+    // Memoir CRUD
 
     fn create_memoir(&self, memoir: Memoir) -> IcmResult<String> {
         self.conn
@@ -152,7 +150,7 @@ impl MemoirStore for SqliteStore {
         collect_rows(rows)
     }
 
-    // --- Concept CRUD ---
+    // Concept CRUD
 
     fn add_concept(&self, concept: Concept) -> IcmResult<String> {
         let labels_json = serde_json::to_string(&concept.labels)?;
@@ -244,7 +242,7 @@ impl MemoirStore for SqliteStore {
         Ok(())
     }
 
-    // --- Concept Search ---
+    // Concept Search
 
     fn list_concepts(&self, memoir_id: &str) -> IcmResult<Vec<Concept>> {
         let mut stmt = self
@@ -342,7 +340,7 @@ impl MemoirStore for SqliteStore {
         collect_rows(rows)
     }
 
-    // --- Refinement ---
+    // Refinement
 
     fn refine_concept(
         &self,
@@ -378,7 +376,7 @@ impl MemoirStore for SqliteStore {
         Ok(())
     }
 
-    // --- Graph ---
+    // Graph
 
     fn add_link(&self, link: ConceptLink) -> IcmResult<String> {
         // Reject self-links: A→A is meaningless and produces a 1-step
@@ -553,7 +551,7 @@ impl MemoirStore for SqliteStore {
         Ok((concepts, links))
     }
 
-    // --- Stats ---
+    // Stats
 
     fn memoir_stats(&self, memoir_id: &str) -> IcmResult<MemoirStats> {
         let total_concepts: usize = self
