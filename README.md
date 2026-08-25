@@ -109,6 +109,10 @@ irm https://raw.githubusercontent.com/rtk-ai/icm/main/install.ps1 | iex
 
 # From source
 cargo install --path crates/icm-cli
+
+# Nix / NixOS (flake)
+nix run github:rtk-ai/icm -- --version
+nix profile install github:rtk-ai/icm
 ```
 
 Re-run the install command to upgrade to the latest release. To pin a version, pass `--version icm-vX.Y.Z` (sh: `sh -s -- --version …`).

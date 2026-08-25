@@ -739,7 +739,7 @@ enum Commands {
 
         /// Launch web dashboard instead of MCP stdio server
         #[cfg(feature = "web")]
-        #[arg(long)]
+        #[arg(long, conflicts_with = "http_proxy")]
         expose: bool,
 
         /// Run a persistent local HTTP API on the given address instead
@@ -753,10 +753,12 @@ enum Commands {
         #[arg(long, value_name = "ADDR")]
         http: Option<std::net::SocketAddr>,
 
-        /// Require `Authorization: Bearer <TOKEN>` on every HTTP
-        /// request (only meaningful with `--http`). Required unless
-        /// `--http` binds a loopback address (127.0.0.1/::1) — binding
-        /// any other interface without a token is refused.
+        /// Forward MCP stdio requests to an `icm serve --http` daemon.
+        #[cfg(feature = "http-api")]
+        #[arg(long = "http-proxy", value_name = "URL", conflicts_with = "http")]
+        http_proxy: Option<String>,
+
+        /// Bearer token used by the HTTP server or proxy.
         #[cfg(feature = "http-api")]
         #[arg(long, value_name = "TOKEN")]
         token: Option<String>,
@@ -1601,6 +1603,22 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let cfg = config::load_config()?;
+
+    #[cfg(feature = "http-api")]
+    if let Commands::Serve {
+        compact,
+        http_proxy: Some(base_url),
+        token,
+        ..
+    } = &cli.command
+    {
+        return http_api::run_mcp_stdio_proxy(
+            base_url,
+            token.as_deref(),
+            *compact || cfg.mcp.compact,
+        );
+    }
+
     let embeddings_enabled =
         cfg.embeddings.enabled && !cli.no_embeddings && std::env::var("ICM_NO_EMBEDDINGS").is_err();
     // Load-dynamic build (issue #345): resolve the onnxruntime runtime. Activate
@@ -2168,6 +2186,8 @@ fn main() -> Result<()> {
             #[cfg(feature = "http-api")]
             http,
             #[cfg(feature = "http-api")]
+                http_proxy: _,
+            #[cfg(feature = "http-api")]
             token,
         } => {
             #[cfg(feature = "web")]
@@ -2188,7 +2208,11 @@ fn main() -> Result<()> {
             if let Some(addr) = http {
                 let boxed_emb: Option<Box<dyn icm_core::Embedder + Send + Sync>> =
                     embedder.map(|e| Box::new(e) as Box<dyn icm_core::Embedder + Send + Sync>);
-                return http_api::run_http_server(store, boxed_emb, addr, token);
+                let auto_consolidate = icm_mcp::AutoConsolidate {
+                    enabled: cfg.memory.auto_consolidate_enabled,
+                    threshold: cfg.memory.auto_consolidate_threshold,
+                };
+                return http_api::run_http_server(store, boxed_emb, addr, token, auto_consolidate);
             }
             #[cfg(feature = "embeddings")]
             let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
@@ -2243,8 +2267,7 @@ fn main() -> Result<()> {
                         emb_ref,
                         &cfg.memory,
                         extract_every,
-                        cfg.extraction.store_raw,
-                        &cfg.extraction.summarizer,
+                        &cfg.extraction,
                         &cfg.archive,
                     )
                 }
@@ -3406,8 +3429,7 @@ fn cmd_hook_post(
     embedder: Option<&dyn icm_core::Embedder>,
     memory_cfg: &crate::config::MemoryConfig,
     extract_every: usize,
-    store_raw: bool,
-    extraction_summarizer: &crate::config::SummarizerConfig,
+    extraction_cfg: &crate::config::ExtractionConfig,
     archive_cfg: &crate::config::ArchiveConfig,
 ) -> Result<()> {
     let Some(input) = read_stdin_utf8_lossy() else {
@@ -3462,6 +3484,13 @@ fn cmd_hook_post(
         }
     }
 
+    // `[extraction].enabled = false` (issue #424) stops here — archive
+    // and code-areas capture above are independent features and must
+    // keep running regardless of this flag.
+    if !extraction_cfg.enabled {
+        return Ok(());
+    }
+
     // Track tool calls in SQLite (atomic, persists across reboots)
     let count = store.increment_hook_counter().unwrap_or(1);
 
@@ -3492,7 +3521,7 @@ fn cmd_hook_post(
     // embedder. The worker (`icm extract-pending` / SessionEnd fork) will
     // dequeue and run the configured LLM CLI. ~50ms / fire vs ~3.7s
     // for the inline fastembed path below.
-    if extraction_summarizer.provider != "none" {
+    if extraction_cfg.summarizer.provider != "none" {
         // Cap to 8 KB to keep the queue reasonable. LLM extraction works
         // fine on the most recent slice; very long outputs are rare and
         // their tail is what matters most for auto-context anyway.
@@ -3501,7 +3530,7 @@ fn cmd_hook_post(
             Ok(_) => {
                 eprintln!(
                     "[icm] enqueued raw output for async LLM extraction (provider={})",
-                    extraction_summarizer.provider,
+                    extraction_cfg.summarizer.provider,
                 );
             }
             Err(e) => {
@@ -3523,7 +3552,7 @@ fn cmd_hook_post(
         store,
         capped_inline,
         &project,
-        store_raw,
+        extraction_cfg.store_raw,
         icm_core::Importance::Medium,
         embedder,
     ) {
@@ -5070,6 +5099,43 @@ Do this BEFORE responding to the user. Not optional.
             )?;
         } else {
             println!("[skill] {:<16} skipped (not detected)", "Pi");
+        }
+
+        // OpenCode: https://opencode.ai/docs/skills/
+        // OpenCode skills require YAML frontmatter with name and description.
+        let opencode_skills_base = PathBuf::from(&home).join(".config/opencode/skills");
+        if force || detect_tool("OpenCode", &home, &vscode_data) {
+            let mut install = |name: &str, prompt: &str| -> Result<()> {
+                let skill_dir = opencode_skills_base.join(format!("icm-{name}"));
+                let skill_path = skill_dir.join("SKILL.md");
+                if let Ok(e) = install_manifest::InstallManifest::entry_from_disk(
+                    &skill_path,
+                    "OpenCode skill",
+                    install_manifest::EntryKind::OwnedFile,
+                ) {
+                    manifest.record(e);
+                }
+                let content = format!(
+                    "\
+---
+name: icm-{name}
+description: ICM persistent memory — /{name}
+---
+
+{prompt}"
+                );
+                install_skill(
+                    &skill_dir,
+                    "SKILL.md",
+                    &content,
+                    &format!("OpenCode /icm-{name}"),
+                )
+            };
+            install("recall", icm_recall_prompt)?;
+            install("remember", icm_remember_prompt)?;
+            install("remember-session", icm_remember_session_prompt)?;
+        } else {
+            println!("[skill] {:<16} skipped (not detected)", "OpenCode");
         }
     }
 
@@ -11346,6 +11412,34 @@ mod cli_contracts_tests {
         assert!(tip.contains("--summarizer-provider"));
         assert!(tip.contains("provider=none"));
         assert!(tip.contains("--keep-originals"));
+    }
+
+    #[cfg(feature = "http-api")]
+    #[test]
+    fn serve_accepts_http_proxy_url_for_stdio_mcp() {
+        let cli = Cli::try_parse_from([
+            "icm",
+            "serve",
+            "--http-proxy",
+            "http://127.0.0.1:11435",
+            "--token",
+            "secret",
+        ])
+        .unwrap();
+
+        let Commands::Serve {
+            compact,
+            http_proxy,
+            token,
+            ..
+        } = cli.command
+        else {
+            panic!("expected serve command");
+        };
+
+        assert!(!compact);
+        assert_eq!(http_proxy.as_deref(), Some("http://127.0.0.1:11435"));
+        assert_eq!(token.as_deref(), Some("secret"));
     }
 }
 
