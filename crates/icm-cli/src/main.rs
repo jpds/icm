@@ -445,6 +445,20 @@ enum Commands {
         dry_run: bool,
     },
 
+    /// Create a safe, consistent backup of the memory database.
+    ///
+    /// Uses the SQLite Online Backup API — safe with concurrent writers and
+    /// active WAL mode. The backup is a fully-checkpointed copy: you can open
+    /// it directly with SQLite without any `-wal`/`-shm` sidecars.
+    ///
+    /// Backup files are named `<db>.backup-<YYYYMMDD-HHMMSS>` and placed
+    /// next to the source database unless `--output` is given.
+    Backup {
+        /// Write the backup to this path instead of the default sibling file.
+        #[arg(long, short, value_name = "PATH")]
+        output: Option<PathBuf>,
+    },
+
     /// Reverse `icm init`: remove ICM config from every detected AI tool.
     ///
     /// Default behavior: timestamped backups under
@@ -521,10 +535,15 @@ enum Commands {
         enqueue: bool,
     },
 
-    /// Import conversations from external sources (Claude.ai, ChatGPT, Claude Code, Slack, text)
+    /// Import memories from external sources (Claude.ai, ChatGPT, Slack, text files)
+    /// or restore a snapshot produced by `icm export`.
+    ///
+    /// For snapshot restore: `icm import --from-export snapshot.jsonl`
+    /// For conversation import: `icm import [--format <FMT>] <PATH>`
     Import {
-        /// Path to file or directory to import
-        path: PathBuf,
+        /// File or directory to import from.
+        #[arg(value_name = "PATH", required_unless_present = "from_export")]
+        path: Option<PathBuf>,
 
         /// Format (auto-detected if omitted)
         #[arg(short, long, default_value = "auto")]
@@ -535,6 +554,52 @@ enum Commands {
         project: String,
 
         /// Preview without storing
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Import a snapshot produced by `icm export` (path or `-` for stdin).
+        ///
+        /// Restores memories, facts, and feedback 1:1 from a JSONL snapshot.
+        /// Mutually exclusive with `<PATH>`, `--format`, and `--project`
+        /// (snapshot topics are restored verbatim from the file).
+        #[arg(
+            long,
+            value_name = "PATH",
+            conflicts_with_all = ["path", "format", "project"],
+            help_heading = "Snapshot restore"
+        )]
+        from_export: Option<String>,
+    },
+
+    /// Export all memories, facts, and feedback to a portable JSONL snapshot.
+    ///
+    /// The snapshot is machine-readable and SQLite-independent: each line is a
+    /// JSON object with a `"type"` field (`"header"`, `"memory"`, `"fact"`,
+    /// `"feedback"`). Use `icm import --from-export` to restore.
+    ///
+    /// Sessions, messages and transcripts are intentionally excluded — they
+    /// are transient, high-volume data that belongs in the archive layer.
+    Export {
+        /// Write to this file instead of stdout.
+        #[arg(long, short, value_name = "PATH")]
+        output: Option<PathBuf>,
+
+        /// Output format: `jsonl` (default, one JSON object per line) or
+        /// `json` (a single JSON array — easier to inspect, larger).
+        #[arg(long, default_value = "jsonl")]
+        format: ExportFormat,
+    },
+
+    /// Import a snapshot produced by `icm export`.
+    ///
+    /// **Deprecated:** use `icm import --from-export <PATH>` instead.
+    #[command(hide = true)]
+    ImportFromExport {
+        /// Path to the JSONL export file, or `-` for stdin.
+        #[arg(long, value_name = "PATH")]
+        from_export: String,
+
+        /// Preview without writing anything to the database.
         #[arg(long)]
         dry_run: bool,
     },
@@ -739,7 +804,7 @@ enum Commands {
 
         /// Launch web dashboard instead of MCP stdio server
         #[cfg(feature = "web")]
-        #[arg(long)]
+        #[arg(long, conflicts_with = "http_proxy")]
         expose: bool,
 
         /// Run a persistent local HTTP API on the given address instead
@@ -753,10 +818,12 @@ enum Commands {
         #[arg(long, value_name = "ADDR")]
         http: Option<std::net::SocketAddr>,
 
-        /// Require `Authorization: Bearer <TOKEN>` on every HTTP
-        /// request (only meaningful with `--http`). Required unless
-        /// `--http` binds a loopback address (127.0.0.1/::1) — binding
-        /// any other interface without a token is refused.
+        /// Forward MCP stdio requests to an `icm serve --http` daemon.
+        #[cfg(feature = "http-api")]
+        #[arg(long = "http-proxy", value_name = "URL", conflicts_with = "http")]
+        http_proxy: Option<String>,
+
+        /// Bearer token used by the HTTP server or proxy.
         #[cfg(feature = "http-api")]
         #[arg(long, value_name = "TOKEN")]
         token: Option<String>,
@@ -1337,6 +1404,17 @@ enum CliImportFormat {
     Text,
 }
 
+/// Output format for `icm export`.
+#[derive(Clone, Copy, ValueEnum)]
+enum ExportFormat {
+    /// One JSON object per line — streaming-friendly, suitable for large
+    /// exports (default).
+    Jsonl,
+    /// A single JSON array — easier to inspect interactively but loads the
+    /// whole export into memory.
+    Json,
+}
+
 #[derive(Clone, ValueEnum)]
 enum CliRelation {
     PartOf,
@@ -1443,6 +1521,149 @@ fn default_db_path() -> PathBuf {
 fn open_store(db: Option<PathBuf>, embedding_dims: usize) -> Result<Store> {
     let path = db.unwrap_or_else(default_db_path);
     Store::with_dims(&path, embedding_dims).context("failed to open database")
+}
+
+/// Open the store and, if `backup_cfg.enabled`, trigger an automatic backup
+/// when the last backup is older than `interval_days`. Backup errors are
+/// logged as warnings — they must not block the normal workflow.
+fn open_store_with_backup(
+    db: Option<PathBuf>,
+    embedding_dims: usize,
+    backup_cfg: &crate::config::BackupConfig,
+) -> Result<Store> {
+    let path = db.clone().unwrap_or_else(default_db_path);
+    let store = open_store(db, embedding_dims)?;
+
+    if backup_cfg.enabled && path.exists() {
+        if backup_cfg.keep_backups == 0 {
+            // Warn once per process invocation — emitting on every store open
+            // would be noisy in hook-heavy setups (PostToolUse fires hundreds
+            // of times per day).
+            static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            WARNED.get_or_init(|| {
+                tracing::warn!(
+                    "backup.keep_backups = 0: backups will accumulate indefinitely — \
+                     disk space may be exhausted over time"
+                );
+            });
+        }
+        // KRIT-5: Use a single atomic SQL upsert (claim_backup_slot) to both
+        // check whether a backup is due AND claim the slot — exactly one
+        // process wins in a thundering-herd scenario (50 agents starting at
+        // once). The old read→decide→write sequence was a race condition.
+        match store.claim_backup_slot(backup_cfg.interval_days) {
+            Ok(true) => {
+                // This process won the race — perform the backup.
+                match do_auto_backup(&path, backup_cfg) {
+                    Ok(backup_path) => {
+                        tracing::info!("auto-backup: wrote {}", backup_path.display());
+                    }
+                    Err(e) => {
+                        tracing::warn!("auto-backup: failed — {e}");
+                        // Reset the slot so the next process will retry.
+                        // Use the Unix epoch ("1970-01-01T00:00:00+00:00") rather
+                        // than MIN_UTC (year −262143): SQLite's julianday() only
+                        // handles years 0000–9999 and returns NULL for out-of-range
+                        // values, which would make the `julianday(?1) - julianday(value)
+                        // >= ?2` condition in claim_backup_slot evaluate to NULL >=
+                        // N = false — permanently blocking any retry. The epoch is
+                        // safely within range and guarantees the next process will
+                        // claim the slot and retry.
+                        let _ =
+                            store.set_metadata_str("last_backup_at", "1970-01-01T00:00:00+00:00");
+                    }
+                }
+            }
+            Ok(false) => {} // Another process claimed the slot — skip.
+            Err(e) => {
+                tracing::warn!("auto-backup: could not claim slot — {e}");
+            }
+        }
+    }
+
+    Ok(store)
+}
+
+/// Perform one automatic backup and rotate old backup files.
+fn do_auto_backup(
+    db_path: &std::path::Path,
+    backup_cfg: &crate::config::BackupConfig,
+) -> Result<PathBuf> {
+    let backup_path = backup_db(db_path)?;
+    rotate_backups(db_path, backup_cfg.keep_backups);
+    Ok(backup_path)
+}
+
+/// Delete the oldest `.backup-*` sibling files when there are more than
+/// `keep` of them. Errors are silently ignored — rotation is best-effort.
+fn rotate_backups(db_path: &std::path::Path, keep: usize) {
+    // keep == 0 means "no rotation — backups accumulate indefinitely".
+    // This matches the documented behaviour of `keep_backups = 0` in config.
+    if keep == 0 {
+        return;
+    }
+    let dir = match db_path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    };
+    let stem = db_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+
+    let mut backups: Vec<_> = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let name = e.file_name();
+            let n = name.to_string_lossy();
+            // KRIT-4: Use an exact prefix "{stem}.backup-" to avoid matching
+            // files that merely start with the stem but belong to a different
+            // application (e.g. "memories.db_v2.backup-...").
+            n.starts_with(&format!("{stem}.backup-"))
+        })
+        .collect();
+
+    if backups.len() <= keep {
+        return;
+    }
+
+    // File names embed a lex-sortable YYYYMMDD-HHMMSS suffix — oldest first.
+    backups.sort_by_key(|e| e.file_name());
+    let to_delete = backups.len() - keep;
+    for entry in backups.into_iter().take(to_delete) {
+        // D5: Log a warning when rotation fails so the user knows the backup
+        // directory is not being maintained as expected.
+        if let Err(e) = std::fs::remove_file(entry.path()) {
+            tracing::warn!(
+                path = %entry.path().display(),
+                "rotate_backups: could not remove old backup: {e}"
+            );
+        }
+    }
+}
+
+/// `icm backup` — explicit on-demand backup.
+fn cmd_backup(db_path: &std::path::Path, output: Option<&std::path::Path>) -> Result<()> {
+    if !db_path.exists() {
+        println!("No database at {} — nothing to back up.", db_path.display());
+        return Ok(());
+    }
+    let backup_path = match output {
+        Some(dst) => {
+            let store = Store::open_maintenance(db_path)
+                .with_context(|| format!("opening {} for backup", db_path.display()))?;
+            store
+                .backup_to(dst)
+                .with_context(|| format!("backup to {}", dst.display()))?;
+            dst.to_path_buf()
+        }
+        None => backup_db(db_path)?,
+    };
+    println!("Backup written to {}", backup_path.display());
+    Ok(())
 }
 
 /// Open the store in read-only mode (issue #263). Resolves the path
@@ -1601,6 +1822,22 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let cfg = config::load_config()?;
+
+    #[cfg(feature = "http-api")]
+    if let Commands::Serve {
+        compact,
+        http_proxy: Some(base_url),
+        token,
+        ..
+    } = &cli.command
+    {
+        return http_api::run_mcp_stdio_proxy(
+            base_url,
+            token.as_deref(),
+            *compact || cfg.mcp.compact,
+        );
+    }
+
     let embeddings_enabled =
         cfg.embeddings.enabled && !cli.no_embeddings && std::env::var("ICM_NO_EMBEDDINGS").is_err();
     // Load-dynamic build (issue #345): resolve the onnxruntime runtime. Activate
@@ -1680,6 +1917,11 @@ fn main() -> Result<()> {
     if let Commands::Repair { dry_run } = command {
         return cmd_repair(&db_path, dry_run);
     }
+    // `icm backup` also bypasses the normal store open: it uses its own
+    // maintenance connection via the Online Backup API.
+    if let Commands::Backup { ref output } = command {
+        return cmd_backup(&db_path, output.as_deref());
+    }
     // `icm hook disable` only edits AI-tool settings files — it needs neither
     // the store nor the DB (and must not create an empty one), so dispatch it
     // before `open_store` too.
@@ -1698,7 +1940,7 @@ fn main() -> Result<()> {
     let store = if read_only_requested(cli.read_only) {
         open_store_readonly(cli_db)?
     } else {
-        open_store(cli_db, embedding_dims)?
+        open_store_with_backup(cli_db, embedding_dims, &cfg.store.backup)?
     };
 
     match command {
@@ -2035,12 +2277,26 @@ fn main() -> Result<()> {
             per_project,
             with_codex_post_hook,
         } => cmd_init(mode, force, per_project, with_codex_post_hook),
-        // Doctor and Repair are dispatched before `open_store` above; these
-        // arms exist only for match exhaustiveness and are unreachable.
-        Commands::Doctor => cmd_doctor(&db_path),
-        Commands::Repair { dry_run } => cmd_repair(&db_path, dry_run),
-        Commands::Uninstall(_) => unreachable!("dispatched before open_store"),
-        // `icm embeddings` is dispatched before `open_store` above; this arm
+        // Doctor, Repair and Backup are dispatched before `open_store` above;
+        // these arms exist only for match exhaustiveness and are unreachable.
+        Commands::Doctor => unreachable!("dispatched before open_store"),
+        Commands::Repair { .. } => unreachable!("dispatched before open_store"),
+        Commands::Backup { .. } => unreachable!("dispatched before open_store"),
+        Commands::Export { output, format } => {
+            cmd_export(&store, &db_path, output.as_deref(), format)
+        }
+        Commands::ImportFromExport {
+            from_export,
+            dry_run,
+        } => {
+            eprintln!(
+                "warning: `icm import-from-export` is deprecated — \
+                 use `icm import --from-export {}` instead",
+                from_export
+            );
+            cmd_import_from_export(&store, &from_export, dry_run)
+        }
+        Commands::Uninstall(_) => unreachable!("dispatched before open_store"), // `icm embeddings` is dispatched before `open_store` above; this arm
         // exists only for match exhaustiveness and is unreachable.
         Commands::Embeddings { .. } => unreachable!("dispatched before open_store"),
         Commands::CodeAreas {
@@ -2076,17 +2332,25 @@ fn main() -> Result<()> {
             format,
             project,
             dry_run,
+            from_export,
         } => {
-            let fmt = match format {
-                CliImportFormat::Auto => None,
-                CliImportFormat::ClaudeAi => Some(import::ImportFormat::ClaudeAi),
-                CliImportFormat::Chatgpt => Some(import::ImportFormat::ChatGpt),
-                CliImportFormat::ClaudeCode => Some(import::ImportFormat::ClaudeCode),
-                CliImportFormat::Slack => Some(import::ImportFormat::Slack),
-                CliImportFormat::Text => Some(import::ImportFormat::Text),
-            };
-            let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
-            import::cmd_import(&store, path, fmt, project, dry_run, emb_ref)
+            if let Some(src) = from_export {
+                // Snapshot restore path — delegate to import-from-export logic.
+                cmd_import_from_export(&store, &src, dry_run)
+            } else {
+                // Conversation import path — existing logic unchanged.
+                let path = path.expect("PATH is required when --from-export is not given");
+                let fmt = match format {
+                    CliImportFormat::Auto => None,
+                    CliImportFormat::ClaudeAi => Some(import::ImportFormat::ClaudeAi),
+                    CliImportFormat::Chatgpt => Some(import::ImportFormat::ChatGpt),
+                    CliImportFormat::ClaudeCode => Some(import::ImportFormat::ClaudeCode),
+                    CliImportFormat::Slack => Some(import::ImportFormat::Slack),
+                    CliImportFormat::Text => Some(import::ImportFormat::Text),
+                };
+                let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+                import::cmd_import(&store, path, fmt, project, dry_run, emb_ref)
+            }
         }
         Commands::RecallContext { query, limit } => cmd_recall_context(&store, &query, limit),
         Commands::RecallProject { limit } => cmd_recall_project(&store, limit),
@@ -2168,6 +2432,8 @@ fn main() -> Result<()> {
             #[cfg(feature = "http-api")]
             http,
             #[cfg(feature = "http-api")]
+                http_proxy: _,
+            #[cfg(feature = "http-api")]
             token,
         } => {
             #[cfg(feature = "web")]
@@ -2188,7 +2454,11 @@ fn main() -> Result<()> {
             if let Some(addr) = http {
                 let boxed_emb: Option<Box<dyn icm_core::Embedder + Send + Sync>> =
                     embedder.map(|e| Box::new(e) as Box<dyn icm_core::Embedder + Send + Sync>);
-                return http_api::run_http_server(store, boxed_emb, addr, token);
+                let auto_consolidate = icm_mcp::AutoConsolidate {
+                    enabled: cfg.memory.auto_consolidate_enabled,
+                    threshold: cfg.memory.auto_consolidate_threshold,
+                };
+                return http_api::run_http_server(store, boxed_emb, addr, token, auto_consolidate);
             }
             #[cfg(feature = "embeddings")]
             let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
@@ -2243,8 +2513,7 @@ fn main() -> Result<()> {
                         emb_ref,
                         &cfg.memory,
                         extract_every,
-                        cfg.extraction.store_raw,
-                        &cfg.extraction.summarizer,
+                        &cfg.extraction,
                         &cfg.archive,
                     )
                 }
@@ -3406,8 +3675,7 @@ fn cmd_hook_post(
     embedder: Option<&dyn icm_core::Embedder>,
     memory_cfg: &crate::config::MemoryConfig,
     extract_every: usize,
-    store_raw: bool,
-    extraction_summarizer: &crate::config::SummarizerConfig,
+    extraction_cfg: &crate::config::ExtractionConfig,
     archive_cfg: &crate::config::ArchiveConfig,
 ) -> Result<()> {
     let Some(input) = read_stdin_utf8_lossy() else {
@@ -3462,6 +3730,13 @@ fn cmd_hook_post(
         }
     }
 
+    // `[extraction].enabled = false` (issue #424) stops here — archive
+    // and code-areas capture above are independent features and must
+    // keep running regardless of this flag.
+    if !extraction_cfg.enabled {
+        return Ok(());
+    }
+
     // Track tool calls in SQLite (atomic, persists across reboots)
     let count = store.increment_hook_counter().unwrap_or(1);
 
@@ -3492,7 +3767,7 @@ fn cmd_hook_post(
     // embedder. The worker (`icm extract-pending` / SessionEnd fork) will
     // dequeue and run the configured LLM CLI. ~50ms / fire vs ~3.7s
     // for the inline fastembed path below.
-    if extraction_summarizer.provider != "none" {
+    if extraction_cfg.summarizer.provider != "none" {
         // Cap to 8 KB to keep the queue reasonable. LLM extraction works
         // fine on the most recent slice; very long outputs are rare and
         // their tail is what matters most for auto-context anyway.
@@ -3501,7 +3776,7 @@ fn cmd_hook_post(
             Ok(_) => {
                 eprintln!(
                     "[icm] enqueued raw output for async LLM extraction (provider={})",
-                    extraction_summarizer.provider,
+                    extraction_cfg.summarizer.provider,
                 );
             }
             Err(e) => {
@@ -3523,7 +3798,7 @@ fn cmd_hook_post(
         store,
         capped_inline,
         &project,
-        store_raw,
+        extraction_cfg.store_raw,
         icm_core::Importance::Medium,
         embedder,
     ) {
@@ -5071,6 +5346,43 @@ Do this BEFORE responding to the user. Not optional.
         } else {
             println!("[skill] {:<16} skipped (not detected)", "Pi");
         }
+
+        // OpenCode: https://opencode.ai/docs/skills/
+        // OpenCode skills require YAML frontmatter with name and description.
+        let opencode_skills_base = PathBuf::from(&home).join(".config/opencode/skills");
+        if force || detect_tool("OpenCode", &home, &vscode_data) {
+            let mut install = |name: &str, prompt: &str| -> Result<()> {
+                let skill_dir = opencode_skills_base.join(format!("icm-{name}"));
+                let skill_path = skill_dir.join("SKILL.md");
+                if let Ok(e) = install_manifest::InstallManifest::entry_from_disk(
+                    &skill_path,
+                    "OpenCode skill",
+                    install_manifest::EntryKind::OwnedFile,
+                ) {
+                    manifest.record(e);
+                }
+                let content = format!(
+                    "\
+---
+name: icm-{name}
+description: ICM persistent memory — /{name}
+---
+
+{prompt}"
+                );
+                install_skill(
+                    &skill_dir,
+                    "SKILL.md",
+                    &content,
+                    &format!("OpenCode /icm-{name}"),
+                )
+            };
+            install("recall", icm_recall_prompt)?;
+            install("remember", icm_remember_prompt)?;
+            install("remember-session", icm_remember_session_prompt)?;
+        } else {
+            println!("[skill] {:<16} skipped (not detected)", "OpenCode");
+        }
     }
 
     // --- Hook mode: install hooks for each detected tool ---
@@ -5849,41 +6161,322 @@ fn report_db_integrity(db_path: &std::path::Path) {
     }
 }
 
-/// Copy the DB (and any `-wal` / `-shm` sidecars) to a timestamped sibling
-/// backup before repair mutates anything (#313). Returns the backup path.
+/// `icm export` — dump all memories, facts, and feedback to a portable snapshot.
+///
+/// Format JSONL (default): one JSON object per line, first line is a header.
+/// Format JSON: a single array (loads whole export into RAM — use for small DBs).
+///
+/// Sessions, messages and transcripts are omitted (transient, high-volume).
+fn cmd_export(
+    store: &Store,
+    db_path: &std::path::Path,
+    output: Option<&std::path::Path>,
+    format: ExportFormat,
+) -> Result<()> {
+    use icm_core::{FeedbackStore, MemoryStore};
+    use std::io::{BufWriter, Write};
+
+    // Collect all records.
+    let memories = store.list_all().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let facts = store.list_all_facts().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let feedback = store
+        .list_feedback(None, usize::MAX)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let header = serde_json::json!({
+        "type": "header",
+        "icm_export_version": 1,
+        "exported_at": chrono::Utc::now().to_rfc3339(),
+        "db_path": db_path.display().to_string(),
+        "counts": {
+            "memories": memories.len(),
+            "facts": facts.len(),
+            "feedback": feedback.len(),
+        }
+    });
+
+    // Open the output writer — stdout if no path given.
+    let mut writer: Box<dyn Write> = match output {
+        Some(path) => Box::new(BufWriter::new(
+            std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?,
+        )),
+        None => Box::new(BufWriter::new(std::io::stdout())),
+    };
+
+    match format {
+        ExportFormat::Jsonl => {
+            // Header line.
+            writeln!(writer, "{}", serde_json::to_string(&header)?)?;
+            // Memory lines.
+            for m in &memories {
+                let mut obj = serde_json::to_value(m)?;
+                obj.as_object_mut()
+                    .expect("serde_json::to_value on a struct always yields a JSON object")
+                    .insert("type".into(), serde_json::json!("memory"));
+                writeln!(writer, "{}", serde_json::to_string(&obj)?)?;
+            }
+            // Fact lines.
+            for f in &facts {
+                let mut obj = serde_json::to_value(f)?;
+                obj.as_object_mut()
+                    .expect("serde_json::to_value on a struct always yields a JSON object")
+                    .insert("type".into(), serde_json::json!("fact"));
+                writeln!(writer, "{}", serde_json::to_string(&obj)?)?;
+            }
+            // Feedback lines.
+            for fb in &feedback {
+                let mut obj = serde_json::to_value(fb)?;
+                obj.as_object_mut()
+                    .expect("serde_json::to_value on a struct always yields a JSON object")
+                    .insert("type".into(), serde_json::json!("feedback"));
+                writeln!(writer, "{}", serde_json::to_string(&obj)?)?;
+            }
+        }
+        ExportFormat::Json => {
+            let mut records = vec![header];
+            for m in &memories {
+                let mut obj = serde_json::to_value(m)?;
+                obj.as_object_mut()
+                    .expect("serde_json::to_value on a struct always yields a JSON object")
+                    .insert("type".into(), serde_json::json!("memory"));
+                records.push(obj);
+            }
+            for f in &facts {
+                let mut obj = serde_json::to_value(f)?;
+                obj.as_object_mut()
+                    .expect("serde_json::to_value on a struct always yields a JSON object")
+                    .insert("type".into(), serde_json::json!("fact"));
+                records.push(obj);
+            }
+            for fb in &feedback {
+                let mut obj = serde_json::to_value(fb)?;
+                obj.as_object_mut()
+                    .expect("serde_json::to_value on a struct always yields a JSON object")
+                    .insert("type".into(), serde_json::json!("feedback"));
+                records.push(obj);
+            }
+            writeln!(writer, "{}", serde_json::to_string_pretty(&records)?)?;
+        }
+    }
+
+    // D9: Use if let instead of is_some() + unwrap() (clippy: option_if_let_else).
+    if let Some(out_path) = output {
+        eprintln!(
+            "Exported {} memories, {} facts, {} feedback records to {}",
+            memories.len(),
+            facts.len(),
+            feedback.len(),
+            out_path.display(),
+        );
+    } else {
+        eprintln!(
+            "Exported {} memories, {} facts, {} feedback records",
+            memories.len(),
+            facts.len(),
+            feedback.len(),
+        );
+    }
+    Ok(())
+}
+
+/// `icm import --from-export` — restore a snapshot produced by `icm export`.
+///
+/// Reads JSONL from a file path or `-` (stdin). Inserts each record through
+/// the normal store API. Idempotent: a record whose ID already exists is
+/// silently skipped.
+fn cmd_import_from_export(store: &Store, from_export: &str, dry_run: bool) -> Result<()> {
+    use icm_core::{FactsStore, FeedbackStore, MemoryStore};
+    use std::io::{BufRead, BufReader};
+
+    let reader: Box<dyn BufRead> = if from_export == "-" {
+        Box::new(BufReader::new(std::io::stdin()))
+    } else {
+        let path = std::path::Path::new(from_export);
+        Box::new(BufReader::new(
+            std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?,
+        ))
+    };
+
+    // KRIT-3: Build the existing feedback ID set once before the loop — O(n)
+    // instead of calling list_feedback per record (O(n²)).
+    let existing_feedback_ids: std::collections::HashSet<String> = if !dry_run {
+        store
+            .list_feedback(None, usize::MAX)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .into_iter()
+            .map(|fb| fb.id)
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+
+    let mut imported_memories = 0usize;
+    let mut imported_facts = 0usize;
+    let mut imported_feedback = 0usize;
+    let mut skipped = 0usize;
+    let mut line_no = 0usize;
+
+    for line in reader.lines() {
+        let line = line.context("reading export file")?;
+        line_no += 1;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let obj: serde_json::Value = serde_json::from_str(trimmed)
+            .with_context(|| format!("line {line_no}: invalid JSON"))?;
+
+        let record_type = obj
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+
+        match record_type {
+            "header" => {
+                // Validate version; warn on mismatch but continue.
+                if let Some(v) = obj.get("icm_export_version").and_then(|v| v.as_u64()) {
+                    if v != 1 {
+                        eprintln!("warning: export version {v} (expected 1) — proceeding anyway");
+                    }
+                }
+                continue;
+            }
+            "memory" => {
+                // KRIT-2: Use the stored_id returned by store.store() to detect
+                // summary_hash deduplication — if the returned ID differs from the
+                // expected ID, the content already existed under a different ID
+                // (e.g. from a previous import that generated a new ULID) and should
+                // count as skipped, not imported.
+                // D10: obj is consumed by from_value; no .clone() needed.
+                let memory: icm_core::Memory = serde_json::from_value(obj)
+                    .with_context(|| format!("line {line_no}: could not parse memory"))?;
+                let expected_id = memory.id.clone();
+                if !dry_run {
+                    match store
+                        .get(&expected_id)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?
+                    {
+                        Some(_) => {
+                            skipped += 1;
+                            continue;
+                        }
+                        None => {
+                            let stored_id =
+                                store.store(memory).map_err(|e| anyhow::anyhow!("{e}"))?;
+                            if stored_id == expected_id {
+                                imported_memories += 1;
+                            } else {
+                                // summary_hash dedup fired — content already present
+                                // under a different ID. Count as skipped.
+                                skipped += 1;
+                            }
+                        }
+                    }
+                } else {
+                    imported_memories += 1;
+                }
+            }
+            "fact" => {
+                // KRIT-1: set_fact always generates a new ULID, so comparing IDs
+                // would never match on a re-import, silently overwriting the active
+                // value. Compare fact values instead — skip only if the stored value
+                // is already identical to what we'd import.
+                // D10: obj consumed by from_value.
+                let fact: icm_core::Fact = serde_json::from_value(obj)
+                    .with_context(|| format!("line {line_no}: could not parse fact"))?;
+                if !dry_run {
+                    match store
+                        .get_fact(&fact.entity, &fact.key)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?
+                    {
+                        // Skip if the active fact already has the same value —
+                        // regardless of ID (set_fact always generates a new ULID,
+                        // so comparing IDs would never match on a re-import and
+                        // would silently overwrite).
+                        Some(existing) if existing.value == fact.value => {
+                            skipped += 1;
+                            continue;
+                        }
+                        _ => {
+                            store
+                                .set_fact(&fact.entity, &fact.key, &fact.value, &fact.source)
+                                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                            imported_facts += 1;
+                        }
+                    }
+                } else {
+                    imported_facts += 1;
+                }
+            }
+            "feedback" => {
+                let fb: icm_core::Feedback = serde_json::from_value(obj)
+                    .with_context(|| format!("line {line_no}: could not parse feedback"))?;
+                if !dry_run {
+                    // KRIT-3: Use the pre-built HashSet for O(1) lookup instead
+                    // of calling list_feedback per record (was O(n²)).
+                    if existing_feedback_ids.contains(&fb.id) {
+                        skipped += 1;
+                        continue;
+                    }
+                    store
+                        .store_feedback(fb)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    imported_feedback += 1;
+                } else {
+                    imported_feedback += 1;
+                }
+            }
+            other => {
+                eprintln!("warning: line {line_no}: unknown type {other:?} — skipped");
+            }
+        }
+    }
+
+    let total_imported = imported_memories + imported_facts + imported_feedback;
+    if dry_run {
+        println!(
+            "[dry-run] Export contains: {} memories, {} facts, {} feedback ({} total).\
+             \n          Note: counts are file totals — existing records are not checked.",
+            imported_memories, imported_facts, imported_feedback, total_imported,
+        );
+    } else {
+        println!(
+            "Imported: {} memories, {} facts, {} feedback — skipped {} existing record(s)",
+            imported_memories, imported_facts, imported_feedback, skipped
+        );
+    }
+    Ok(())
+}
+
+/// Create a consistent, point-in-time backup of the database using the
+/// SQLite Online Backup API.
+///
+/// Unlike the previous `std::fs::copy` approach, this is safe while the
+/// database is open in WAL mode: the API locks pages one at a time, retries
+/// any page modified by a concurrent writer, and produces a fully
+/// checkpointed destination. No separate `-wal`/`-shm` sidecar copy is
+/// needed — all committed WAL frames are folded into the backup file.
+///
+/// Returns the path the backup was written to.
 fn backup_db(db_path: &std::path::Path) -> Result<PathBuf> {
     use std::ffi::OsString;
     let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
-    // Append the suffix to the raw file name (OsString, not a lossy `display()`
-    // round-trip) so non-UTF8 paths back up to the right place.
     let mut backup_name = db_path
         .file_name()
         .map(|s| s.to_os_string())
         .unwrap_or_else(|| OsString::from("memories.db"));
     backup_name.push(format!(".backup-{ts}"));
     let backup = db_path.with_file_name(&backup_name);
-    std::fs::copy(db_path, &backup)
-        .with_context(|| format!("backing up {} to {}", db_path.display(), backup.display()))?;
-    // Also preserve the WAL/SHM sidecars if present so the backup captures
-    // rows that a WAL-mode DB may hold only in `-wal` until checkpoint. A
-    // sidecar copy failure is surfaced (not silently dropped): the backup
-    // would otherwise be an incomplete snapshot the user is told is intact.
-    for ext in ["-wal", "-shm"] {
-        let mut side = db_path.as_os_str().to_os_string();
-        side.push(ext);
-        let side = PathBuf::from(side);
-        if side.exists() {
-            let mut side_backup = backup.as_os_str().to_os_string();
-            side_backup.push(ext);
-            if let Err(e) = std::fs::copy(&side, PathBuf::from(side_backup)) {
-                eprintln!(
-                    "[repair] warning: could not back up sidecar {} ({e}); \
-                     the backup may be missing recently-written rows",
-                    side.display()
-                );
-            }
-        }
-    }
+
+    // Open the source with a maintenance (writable) connection so the Backup
+    // API can checkpoint and include all WAL frames. Open-maintenance skips
+    // schema migration and journal_mode changes, matching what we need here.
+    let store = Store::open_maintenance(db_path)
+        .with_context(|| format!("opening {} for backup", db_path.display()))?;
+    store
+        .backup_to(&backup)
+        .with_context(|| format!("backup {} → {}", db_path.display(), backup.display()))?;
     Ok(backup)
 }
 
@@ -11347,6 +11940,34 @@ mod cli_contracts_tests {
         assert!(tip.contains("provider=none"));
         assert!(tip.contains("--keep-originals"));
     }
+
+    #[cfg(feature = "http-api")]
+    #[test]
+    fn serve_accepts_http_proxy_url_for_stdio_mcp() {
+        let cli = Cli::try_parse_from([
+            "icm",
+            "serve",
+            "--http-proxy",
+            "http://127.0.0.1:11435",
+            "--token",
+            "secret",
+        ])
+        .unwrap();
+
+        let Commands::Serve {
+            compact,
+            http_proxy,
+            token,
+            ..
+        } = cli.command
+        else {
+            panic!("expected serve command");
+        };
+
+        assert!(!compact);
+        assert_eq!(http_proxy.as_deref(), Some("http://127.0.0.1:11435"));
+        assert_eq!(token.as_deref(), Some("secret"));
+    }
 }
 
 #[cfg(test)]
@@ -12448,6 +13069,364 @@ mod cmd_memoir_tests {
         assert!(
             matches!(relation, CliRelation::DependsOn),
             "relation must map to depends-on"
+        );
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// rotate_backups tests
+// ──────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod rotate_backups_tests {
+    use super::rotate_backups;
+    use std::fs;
+    use std::path::PathBuf;
+
+    /// Create a fake db path inside `dir` and touch N backup files that follow
+    /// the `<stem>.backup-YYYYMMDD-HHMMSS` naming convention.  The timestamps
+    /// are lexicographically ordered (oldest first) so sorting by name yields
+    /// the correct oldest-first order.
+    fn make_backup_files(dir: &std::path::Path, stem: &str, suffixes: &[&str]) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        for s in suffixes {
+            let name = format!("{stem}.backup-{s}");
+            let p = dir.join(&name);
+            fs::write(&p, b"").unwrap();
+            paths.push(p);
+        }
+        paths
+    }
+
+    /// Returns the db path used as the anchor for rotate_backups.
+    fn db_path(dir: &std::path::Path, stem: &str) -> PathBuf {
+        dir.join(stem)
+    }
+
+    // ── helpers ──────────────────────────────────────────────────────────
+
+    /// Count files in `dir` whose name matches `<stem>.backup-*`.
+    fn count_backups(dir: &std::path::Path, stem: &str) -> usize {
+        fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let n = e.file_name();
+                n.to_string_lossy().starts_with(&format!("{stem}.backup-"))
+            })
+            .count()
+    }
+
+    // ── tests ─────────────────────────────────────────────────────────────
+
+    /// If there are keep + 1 backup files, the oldest one must be deleted,
+    /// leaving exactly `keep` files behind.
+    #[test]
+    fn rotate_backups_removes_oldest_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let stem = "memories.db";
+        // 4 backups, oldest first lexicographically.
+        let suffixes = [
+            "20250101-000000",
+            "20250102-000000",
+            "20250103-000000",
+            "20250104-000000",
+        ];
+        make_backup_files(dir.path(), stem, &suffixes);
+        assert_eq!(count_backups(dir.path(), stem), 4);
+
+        let keep = 3usize;
+        rotate_backups(&db_path(dir.path(), stem), keep);
+
+        assert_eq!(
+            count_backups(dir.path(), stem),
+            keep,
+            "rotate should leave exactly `keep` backups"
+        );
+        // The oldest file must be gone.
+        let oldest = dir.path().join(format!("{stem}.backup-{}", suffixes[0]));
+        assert!(!oldest.exists(), "oldest backup must have been removed");
+        // The newest files must still exist.
+        for s in &suffixes[1..] {
+            let p = dir.path().join(format!("{stem}.backup-{s}"));
+            assert!(p.exists(), "newer backup {s} must still exist");
+        }
+    }
+
+    /// Unrelated files (different stem or extension) must not be touched.
+    #[test]
+    fn rotate_backups_does_not_remove_unrelated_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let stem = "memories.db";
+        // 2 genuine backup files.
+        make_backup_files(dir.path(), stem, &["20250101-000000", "20250102-000000"]);
+        // Unrelated files: different stem, or ".old" suffix.
+        let unrelated: Vec<PathBuf> = vec![
+            dir.path().join("memories.db.old"),
+            dir.path().join("memories.db_v2.backup-20250101-000000"),
+            dir.path().join("other.db.backup-20250101-000000"),
+            dir.path().join("notes.txt"),
+        ];
+        for p in &unrelated {
+            fs::write(p, b"").unwrap();
+        }
+
+        // keep=1 should delete only the oldest genuine backup.
+        rotate_backups(&db_path(dir.path(), stem), 1);
+
+        assert_eq!(
+            count_backups(dir.path(), stem),
+            1,
+            "one genuine backup must remain"
+        );
+        // All unrelated files must be intact.
+        for p in &unrelated {
+            assert!(
+                p.exists(),
+                "unrelated file {} must not be removed",
+                p.display()
+            );
+        }
+    }
+
+    /// `keep = 0` is the "accumulate indefinitely" mode — rotate_backups must
+    /// return without deleting anything.
+    #[test]
+    fn rotate_backups_keep_zero_does_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let stem = "memories.db";
+        make_backup_files(dir.path(), stem, &["20250101-000000", "20250102-000000"]);
+
+        rotate_backups(&db_path(dir.path(), stem), 0);
+
+        assert_eq!(
+            count_backups(dir.path(), stem),
+            2,
+            "keep=0 must leave all backups intact"
+        );
+    }
+
+    /// When the number of existing backups is exactly `keep`, nothing should
+    /// be deleted.
+    #[test]
+    fn rotate_backups_noop_when_within_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let stem = "memories.db";
+        let suffixes = ["20250101-000000", "20250102-000000", "20250103-000000"];
+        make_backup_files(dir.path(), stem, &suffixes);
+
+        rotate_backups(&db_path(dir.path(), stem), suffixes.len());
+
+        assert_eq!(
+            count_backups(dir.path(), stem),
+            suffixes.len(),
+            "no backup must be deleted when count == keep"
+        );
+        for s in &suffixes {
+            let p = dir.path().join(format!("{stem}.backup-{s}"));
+            assert!(p.exists(), "backup {s} must still exist");
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// export / import round-trip tests
+// ──────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod export_import_roundtrip_tests {
+    use super::cmd_import_from_export;
+    use icm_core::{Feedback, Importance, Memory};
+    use icm_store::Store;
+    use std::io::Write;
+
+    fn in_memory_store() -> Store {
+        Store::in_memory().unwrap()
+    }
+
+    /// Build a minimal JSONL export string from `store` manually (mirrors what
+    /// `cmd_export` produces) so that this test does not depend on file I/O in
+    /// `cmd_export` itself — only `cmd_import_from_export` is exercised.
+    fn build_jsonl(store: &Store) -> String {
+        use icm_core::{FeedbackStore, MemoryStore};
+
+        let memories = store.list_all().unwrap();
+        let facts = store.list_all_facts().unwrap();
+        let feedback = store.list_feedback(None, usize::MAX).unwrap();
+
+        let mut lines = Vec::<String>::new();
+        // Header line (version 1).
+        lines.push(
+            serde_json::json!({
+                "type": "header",
+                "icm_export_version": 1,
+                "exported_at": chrono::Utc::now().to_rfc3339(),
+                "db_path": ":memory:",
+                "counts": {
+                    "memories": memories.len(),
+                    "facts": facts.len(),
+                    "feedback": feedback.len(),
+                }
+            })
+            .to_string(),
+        );
+        for m in &memories {
+            let mut obj = serde_json::to_value(m).unwrap();
+            obj.as_object_mut()
+                .unwrap()
+                .insert("type".into(), serde_json::json!("memory"));
+            lines.push(obj.to_string());
+        }
+        for f in &facts {
+            let mut obj = serde_json::to_value(f).unwrap();
+            obj.as_object_mut()
+                .unwrap()
+                .insert("type".into(), serde_json::json!("fact"));
+            lines.push(obj.to_string());
+        }
+        for fb in &feedback {
+            let mut obj = serde_json::to_value(fb).unwrap();
+            obj.as_object_mut()
+                .unwrap()
+                .insert("type".into(), serde_json::json!("feedback"));
+            lines.push(obj.to_string());
+        }
+        lines.join("\n") + "\n"
+    }
+
+    /// Parse the "Imported: X memories, Y facts, Z feedback — skipped N" line
+    /// printed by cmd_import_from_export.
+    #[allow(dead_code)]
+    fn parse_import_output(output: &str) -> (usize, usize, usize, usize) {
+        // We cannot easily capture stdout from the function, but we can infer
+        // correctness by querying the store directly.  This helper is therefore
+        // a no-op placeholder kept for documentation; real assertions use the
+        // store API below.
+        let _ = output;
+        (0, 0, 0, 0)
+    }
+
+    /// Full round-trip: populate a source store, serialise to JSONL, import
+    /// into a fresh store, and verify every record arrived.
+    #[test]
+    fn export_import_roundtrip_is_idempotent() {
+        use icm_core::{FactsStore, FeedbackStore, MemoryStore};
+
+        // 1. Source store with 1 memory, 1 fact, 1 feedback.
+        let src = in_memory_store();
+        let mem = Memory::new(
+            "test-topic".into(),
+            "A test memory for round-trip".into(),
+            Importance::Medium,
+        );
+        src.store(mem).unwrap();
+        src.set_fact("entity:test", "key1", "value1", "test")
+            .unwrap();
+        let fb = Feedback::new(
+            "test-topic".into(),
+            "ctx".into(),
+            "pred".into(),
+            "corr".into(),
+            None,
+            "test".into(),
+        );
+        src.store_feedback(fb).unwrap();
+
+        // 2. Serialise to JSONL.
+        let jsonl = build_jsonl(&src);
+        assert!(!jsonl.is_empty());
+
+        // 3. Write JSONL to a temp file so cmd_import_from_export can read it.
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(jsonl.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+        let tmp_path = tmp.path().to_str().unwrap().to_owned();
+
+        // 4. Import into a fresh store.
+        let dst = in_memory_store();
+        cmd_import_from_export(&dst, &tmp_path, false).unwrap();
+
+        // 5. Verify counts.
+        assert_eq!(
+            dst.list_all().unwrap().len(),
+            1,
+            "destination must have exactly 1 memory after import"
+        );
+        assert_eq!(
+            dst.list_all_facts().unwrap().len(),
+            1,
+            "destination must have exactly 1 fact after import"
+        );
+        assert_eq!(
+            dst.list_feedback(None, usize::MAX).unwrap().len(),
+            1,
+            "destination must have exactly 1 feedback record after import"
+        );
+
+        // 6. Import the same JSONL a second time (idempotency check).
+        cmd_import_from_export(&dst, &tmp_path, false).unwrap();
+
+        // 7. Counts must be unchanged.
+        assert_eq!(
+            dst.list_all().unwrap().len(),
+            1,
+            "memory count must not grow on re-import"
+        );
+        assert_eq!(
+            dst.list_all_facts().unwrap().len(),
+            1,
+            "fact count must not grow on re-import (same value → skipped)"
+        );
+        assert_eq!(
+            dst.list_feedback(None, usize::MAX).unwrap().len(),
+            1,
+            "feedback count must not grow on re-import"
+        );
+    }
+
+    /// Verify that `cmd_import_from_export` correctly imports records from a
+    /// JSONL snapshot and is idempotent — re-importing the same file does not
+    /// create duplicate records. This function is the shared implementation
+    /// called by both `Commands::Import { from_export: Some(..) }` (new path)
+    /// and the deprecated `Commands::ImportFromExport` dispatch.
+    #[test]
+    fn cmd_import_from_export_is_idempotent() {
+        use icm_core::MemoryStore;
+
+        // 1. Build a source store with one memory record.
+        let src = in_memory_store();
+        let mem = Memory::new(
+            "dispatch-test".into(),
+            "dispatch path memory record".into(),
+            icm_core::Importance::Medium,
+        );
+        src.store(mem).unwrap();
+
+        // 2. Serialise using the shared helper (same format cmd_export produces).
+        let jsonl = build_jsonl(&src);
+        assert!(!jsonl.is_empty());
+
+        // 3. Write to a temp file.
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut tmp, jsonl.as_bytes()).unwrap();
+        std::io::Write::flush(&mut tmp).unwrap();
+        let tmp_path = tmp.path().to_str().unwrap().to_owned();
+
+        // 4. Import (simulates Commands::Import { from_export: Some(..) } dispatch).
+        let store = in_memory_store();
+        cmd_import_from_export(&store, &tmp_path, false).unwrap();
+
+        // 5. Record must be present.
+        assert_eq!(
+            store.list_all().unwrap().len(),
+            1,
+            "store must contain exactly 1 memory after import via new dispatch path"
+        );
+
+        // 6. Re-import — idempotency: no duplicate.
+        cmd_import_from_export(&store, &tmp_path, false).unwrap();
+        assert_eq!(
+            store.list_all().unwrap().len(),
+            1,
+            "memory count must not grow on re-import (idempotency)"
         );
     }
 }

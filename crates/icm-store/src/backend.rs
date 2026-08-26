@@ -251,6 +251,73 @@ impl Store {
         }
     }
 
+    /// Create a consistent, point-in-time backup to `dst` using the SQLite
+    /// Online Backup API. Only applies to the SQLite backend; remote backends
+    /// (Postgres, OpenSearch) manage their own durability and return a config
+    /// error here — callers should check [`BackendKind::from_env`] and skip
+    /// the backup step for non-SQLite setups.
+    pub fn backup_to(&self, dst: &Path) -> IcmResult<()> {
+        match self {
+            #[cfg(feature = "backend-sqlite")]
+            Store::Sqlite(s) => s.backup_to(dst),
+            #[allow(unreachable_patterns)]
+            _ => Err(IcmError::Config(
+                "backup_to is only supported on the SQLite backend".into(),
+            )),
+        }
+    }
+
+    /// Atomically claim the backup slot (KRIT-5). Returns `true` if this
+    /// process should perform the backup. Non-SQLite backends always return
+    /// `false` — they manage their own durability.
+    pub fn claim_backup_slot(&self, interval_days: u32) -> IcmResult<bool> {
+        match self {
+            #[cfg(feature = "backend-sqlite")]
+            Store::Sqlite(s) => s.claim_backup_slot(interval_days),
+            #[allow(unreachable_patterns)]
+            _ => Ok(false), // non-SQLite backends manage their own durability
+        }
+    }
+
+    /// List every active fact across all entities (for `icm export`).
+    /// Only supported on the SQLite backend.
+    pub fn list_all_facts(&self) -> IcmResult<Vec<Fact>> {
+        match self {
+            #[cfg(feature = "backend-sqlite")]
+            Store::Sqlite(s) => s.list_all_facts(),
+            #[allow(unreachable_patterns)]
+            _ => Err(IcmError::Config(
+                "list_all_facts is only supported on the SQLite backend".into(),
+            )),
+        }
+    }
+
+    /// Read a string value from `icm_metadata`. Returns `Ok(None)` when
+    /// absent. Only supported on the SQLite backend.
+    pub fn get_metadata_str(&self, key: &str) -> IcmResult<Option<String>> {
+        match self {
+            #[cfg(feature = "backend-sqlite")]
+            Store::Sqlite(s) => s.get_metadata_str(key),
+            #[allow(unreachable_patterns)]
+            _ => Err(IcmError::Config(
+                "get_metadata_str is only supported on the SQLite backend".into(),
+            )),
+        }
+    }
+
+    /// Upsert a string value into `icm_metadata`. Only supported on the
+    /// SQLite backend.
+    pub fn set_metadata_str(&self, key: &str, value: &str) -> IcmResult<()> {
+        match self {
+            #[cfg(feature = "backend-sqlite")]
+            Store::Sqlite(s) => s.set_metadata_str(key, value),
+            #[allow(unreachable_patterns)]
+            _ => Err(IcmError::Config(
+                "set_metadata_str is only supported on the SQLite backend".into(),
+            )),
+        }
+    }
+
     /// In-memory store for the active backend (remote backends connect to
     /// their configured endpoint).
     pub fn in_memory() -> IcmResult<Self> {

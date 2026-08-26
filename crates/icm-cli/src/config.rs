@@ -39,6 +39,37 @@ pub struct Config {
 pub struct StoreConfig {
     /// SQLite database path. Default: platform-specific data dir.
     pub path: Option<String>,
+    /// Automatic backup settings.
+    pub backup: BackupConfig,
+}
+
+/// Automatic backup settings (issue: preventive backups for multi-agent setups).
+///
+/// Backups use the SQLite Online Backup API — safe with concurrent writers.
+/// Only applies to the SQLite backend; ignored for Postgres / OpenSearch.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct BackupConfig {
+    /// Enable automatic backups on store open.
+    pub enabled: bool,
+    /// Run a backup if the last one is older than this many days.
+    pub interval_days: u32,
+    /// Maximum number of `.backup-*` files to keep; oldest are pruned first.
+    pub keep_backups: usize,
+}
+
+impl Default for BackupConfig {
+    fn default() -> Self {
+        Self {
+            // POW-6: Default to enabled — ICM is designed for multi-agent
+            // setups where a corrupt or accidentally deleted DB cannot be
+            // recovered without a backup. New users get protection out of the
+            // box without having to read the documentation first.
+            enabled: true,
+            interval_days: 7,
+            keep_backups: 5,
+        }
+    }
 }
 
 /// Memory decay and pruning settings.

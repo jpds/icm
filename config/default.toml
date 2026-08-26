@@ -11,6 +11,23 @@
 # Uncomment to use a custom location:
 # path = "/custom/path/to/memories.db"
 
+[store.backup]
+# Automatic preventive backups using the SQLite Online Backup API.
+# Safe for concurrent writers — no need to stop agents while backing up.
+# Only applies to the SQLite backend.
+
+# Automatic backups are ENABLED by default (interval_days = 7, keep_backups = 5).
+# To disable, uncomment:
+# enabled = false
+
+# Create a new backup if the last one is older than this many days (default: 7).
+# interval_days = 7
+
+# Keep at most this many .backup-* files; oldest are deleted first (default: 5).
+# Set to 0 to disable rotation (backups accumulate indefinitely —
+# disk space will grow without bound).
+# keep_backups = 5
+
 [memory]
 default_importance = "medium"
 
