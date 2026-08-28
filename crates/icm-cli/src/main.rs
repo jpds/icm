@@ -2893,6 +2893,27 @@ fn cmd_remember(
     )
 }
 
+/// How many candidates to ask the store for before applying a
+/// project/topic/keyword filter.
+///
+/// `search_hybrid`/`search_fts`/`search_by_keywords` are topic-oblivious —
+/// they rank and truncate to `limit` globally, across every topic in the
+/// database. Passing the caller's `limit` straight through when a filter is
+/// about to run means the filter only ever sees the global top-`limit`
+/// candidates: on a database with several topics, those can all belong to
+/// topics other than the one being filtered for, and recall reports "no
+/// memories" even though relevant matches exist further down the ranking
+/// (same bug the MCP `tool_recall` path already fixed — this mirrors it for
+/// the CLI). Widen the pool whenever a filter is active; leave it alone
+/// otherwise so the unfiltered path doesn't pay for candidates it won't use.
+fn recall_query_limit(limit: usize, filters_active: bool) -> usize {
+    if filters_active {
+        (limit * 10).min(200)
+    } else {
+        limit
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_recall(
     store: &Store,
@@ -2918,10 +2939,24 @@ fn cmd_recall(
         }
     };
 
+    // Same audit finding the MCP `tool_recall` path already fixed, ported
+    // here: `search_hybrid`/`search_fts`/`search_by_keywords` are
+    // topic-oblivious and truncate to `limit` BEFORE the project/topic/
+    // keyword filter below runs. On a database with several topics (the
+    // normal case — this store alone has ~30), the global top-`limit` hits
+    // can all belong to other topics, so a `-t` filter finds nothing even
+    // though relevant same-topic memories exist further down the ranking.
+    // When any filter is active, request a much larger candidate pool so
+    // filtering has enough to work with; truncate to the caller's `limit`
+    // only at the very end (`expand_with_neighbors`'s `max_total`).
+    let project_active = matches!(project, Some(p) if !p.is_empty());
+    let filters_active = project_active || topic.is_some() || keyword.is_some();
+    let query_limit = recall_query_limit(limit, filters_active);
+
     // Try hybrid search if embedder is available; fall back to FTS / keywords.
     let scored: Option<Vec<(Memory, f32)>> = embedder
         .and_then(|emb| emb.embed_query(query).ok())
-        .and_then(|query_emb| store.search_hybrid(query, &query_emb, limit).ok());
+        .and_then(|query_emb| store.search_hybrid(query, &query_emb, query_limit).ok());
 
     let (mut results, has_score): (Vec<(Memory, Option<f32>)>, bool) = match scored {
         Some(scored) => {
@@ -2929,10 +2964,10 @@ fn cmd_recall(
             (pairs, true)
         }
         None => {
-            let mut fts = store.search_fts(query, limit)?;
+            let mut fts = store.search_fts(query, query_limit)?;
             if fts.is_empty() {
                 let kws: Vec<&str> = query.split_whitespace().collect();
-                fts = store.search_by_keywords(&kws, limit)?;
+                fts = store.search_by_keywords(&kws, query_limit)?;
             }
             (fts.into_iter().map(|m| (m, None)).collect(), false)
         }
@@ -13171,6 +13206,25 @@ mod cmd_remember_tests {
         assert!(memories
             .iter()
             .any(|m| m.summary.contains("closes the recall gap")));
+    }
+}
+
+#[cfg(test)]
+mod cmd_recall_tests {
+    use super::*;
+
+    /// Audit finding (ported from the MCP `tool_recall` path): a
+    /// project/topic/keyword filter must not shrink the candidate pool the
+    /// store searches — only the final result count.
+    #[test]
+    fn recall_query_limit_widens_only_when_a_filter_is_active() {
+        assert_eq!(recall_query_limit(5, false), 5);
+        assert_eq!(recall_query_limit(5, true), 50);
+    }
+
+    #[test]
+    fn recall_query_limit_caps_at_200() {
+        assert_eq!(recall_query_limit(100, true), 200);
     }
 }
 
