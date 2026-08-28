@@ -352,7 +352,11 @@ impl MemoryStore for SqliteStore {
     ) -> IcmResult<Vec<(Memory, f32)>> {
         let limit = limit.min(1000);
         let pool_size = limit * 4;
-        let sanitized = sanitize_fts_query(query);
+        // OR-joined (not `sanitize_fts_query`'s AND): a multi-word natural-
+        // language question needs only one distinctive shared word with a
+        // candidate to contribute a BM25 signal alongside the vector score.
+        // See `sanitize_fts_query_any`'s docs.
+        let sanitized = sanitize_fts_query_any(query);
 
         // 1. Get FTS results with rank scores
         let fts_sql =
