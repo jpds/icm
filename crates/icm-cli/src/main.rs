@@ -2794,13 +2794,14 @@ fn cmd_store(
                 access_count: existing.access_count,
                 weight: 1.0,
                 topic: existing.topic.clone(),
-                summary: memory.summary.clone(),
+                // Never wholesale-replace: `existing` and `memory` are only
+                // known to be semantically close (cosine similarity), not
+                // the same statement — see `merge_summaries`'s docs for a
+                // measured case (two distinct LoCoMo greeting turns scored
+                // 0.98) where that destroyed the earlier memory's content.
+                summary: icm_core::merge_summaries(&existing.summary, &memory.summary),
                 raw_excerpt: memory.raw_excerpt.clone().or(existing.raw_excerpt),
-                keywords: if memory.keywords.is_empty() {
-                    existing.keywords
-                } else {
-                    memory.keywords.clone()
-                },
+                keywords: icm_core::union_keywords(&existing.keywords, &memory.keywords),
                 embedding: memory.embedding.clone(),
                 // Never let a near-dup merge downgrade importance — a
                 // `--importance` omission defaults to Medium and would
