@@ -1073,18 +1073,17 @@ fn tool_store(
                 access_count: existing.access_count,
                 weight: 1.0,
                 topic: existing.topic.clone(),
-                summary: content.to_string(),
+                // Never wholesale-replace: `existing` and the incoming
+                // content are only known to be semantically close (cosine
+                // similarity), not the same statement — see
+                // `merge_summaries`'s docs for a measured case (two distinct
+                // LoCoMo greeting turns scored 0.98) where that destroyed
+                // the earlier memory's content.
+                summary: icm_core::merge_summaries(&existing.summary, content),
                 raw_excerpt: get_str(args, "raw_excerpt")
                     .map(|r| r.into())
                     .or_else(|| existing.raw_excerpt.clone()),
-                keywords: {
-                    let kw = parse_keywords(args);
-                    if kw.is_empty() {
-                        existing.keywords.clone()
-                    } else {
-                        kw
-                    }
-                },
+                keywords: icm_core::union_keywords(&existing.keywords, &parse_keywords(args)),
                 embedding: Some(query_emb.clone()),
                 // Never let a near-dup merge downgrade importance: an MCP
                 // caller that omits `importance` defaults to Medium, which

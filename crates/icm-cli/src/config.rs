@@ -99,7 +99,17 @@ impl Default for EmbeddingsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            model: "intfloat/multilingual-e5-base".into(),
+            // Single source of truth: `icm_core::fastembed_embedder`'s
+            // `DEFAULT_MODEL`. This used to be a separately hardcoded
+            // string here — the two drifted (this one kept pointing at
+            // multilingual-e5-base after icm-core's default moved to
+            // bge-m3), so a real `icm store`/`icm recall` run never picked
+            // up the change. `--no-embeddings`-only builds don't compile
+            // in that constant, so fall back to the same literal it holds.
+            #[cfg(feature = "embeddings")]
+            model: icm_core::DEFAULT_EMBEDDING_MODEL.into(),
+            #[cfg(not(feature = "embeddings"))]
+            model: "BAAI/bge-m3".into(),
         }
     }
 }

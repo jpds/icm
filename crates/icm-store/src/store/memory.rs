@@ -351,8 +351,30 @@ impl MemoryStore for SqliteStore {
         limit: usize,
     ) -> IcmResult<Vec<(Memory, f32)>> {
         let limit = limit.min(1000);
-        let pool_size = limit * 4;
-        let sanitized = sanitize_fts_query(query);
+        // Candidate-pool sizing is deliberately decoupled from `limit`
+        // once `limit` gets large: a caller widens `limit` well past what
+        // it actually wants back when a topic/project/keyword filter is
+        // about to run post-hoc (headroom for candidates the filter will
+        // drop — see `recall_query_limit` in icm-cli). Scaling `pool_size`
+        // with that inflated `limit` doesn't just fetch more candidates to
+        // filter, it changes the blended score of candidates ALREADY in
+        // range: `vec_scores`/`fts_scores` default a missing side to 0.0,
+        // so a candidate outside the (small) vector pool but inside the
+        // (now much larger) FTS pool used to score `0.3*fts + 0.7*0.0`;
+        // widening the vector pool to match gives it a real, usually
+        // higher, vector score too — shifting rankings among candidates
+        // that were already well-scored. Measured on a LoCoMo benchmark
+        // pilot: pool_size scaled with an inflated limit=50 dropped
+        // recall@5 from 56.2% (unscaled) to 52.7%/49.1% under looser caps;
+        // pinning the pool-sizing input to a small constant (5) held it at
+        // 56.2% while a topic-filtered query still got its full headroom
+        // via the unmodified final `truncate(limit)` below.
+        let pool_size = limit.clamp(1, 5) * 4;
+        // OR-joined (not `sanitize_fts_query`'s AND): a multi-word natural-
+        // language question needs only one distinctive shared word with a
+        // candidate to contribute a BM25 signal alongside the vector score.
+        // See `sanitize_fts_query_any`'s docs.
+        let sanitized = sanitize_fts_query_any(query);
 
         // 1. Get FTS results with rank scores
         let fts_sql =

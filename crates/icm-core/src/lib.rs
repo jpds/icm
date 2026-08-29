@@ -45,7 +45,7 @@ pub use error::{IcmError, IcmResult};
 pub use facts::{Fact, FactsStats};
 pub use facts_store::FactsStore;
 #[cfg(feature = "embeddings")]
-pub use fastembed_embedder::FastEmbedder;
+pub use fastembed_embedder::{FastEmbedder, DEFAULT_MODEL as DEFAULT_EMBEDDING_MODEL};
 pub use feedback::{Feedback, FeedbackStats};
 pub use feedback_store::FeedbackStore;
 pub use memoir::{Concept, ConceptLink, Label, Memoir, MemoirStats, Relation};
@@ -54,7 +54,9 @@ pub use memory::{
     max_importance, Importance, Memory, MemorySource, PatternCluster, Scope, StoreStats,
     TopicHealth,
 };
-pub use store::{find_similar_memory, MemoryStore, DEDUP_SIMILARITY_THRESHOLD};
+pub use store::{
+    find_similar_memory, merge_summaries, union_keywords, MemoryStore, DEDUP_SIMILARITY_THRESHOLD,
+};
 pub use transcript::{Message, Role, Session, TranscriptHit, TranscriptStats};
 pub use transcript_store::TranscriptStore;
 pub use wake_up::{

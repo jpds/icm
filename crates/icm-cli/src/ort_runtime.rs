@@ -12,10 +12,13 @@
 //! - [`cmd_download`] / [`cmd_status`] back the explicit `icm embeddings`
 //!   subcommand for scripted setup.
 //!
-//! Safety: `ort` 2.0.0-rc.9 targets ONNX Runtime **1.20**; a mismatched runtime
-//! makes ort's version assertion abort under `panic = "abort"`. We therefore
-//! pin 1.20.1, verify a hard-coded SHA256, and trust *only* our managed copy
-//! (or an explicit user `ORT_DYLIB_PATH`) — never an ambient system library.
+//! Safety: `ort`'s version check compares the loaded library's minor version
+//! against `ORT_API_VERSION` (17 + one per enabled `api-N` feature) and
+//! rejects anything *older* under `panic = "abort"` — fastembed enables
+//! `api-24`, so this build requires ONNX Runtime >= **1.24**. We pin the
+//! latest stable release satisfying that, verify a hard-coded SHA256, and
+//! trust *only* our managed copy (or an explicit user `ORT_DYLIB_PATH`) —
+//! never an ambient system library.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -24,8 +27,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
 
 /// onnxruntime release to fetch. MUST stay ABI-compatible with the `ort`
-/// version fastembed pins (currently `ort` 2.0.0-rc.9 → ONNX Runtime 1.20).
-const ORT_VERSION: &str = "1.20.1";
+/// version fastembed pins (currently `ort` 2.0.0-rc.13, `api-24` feature →
+/// requires ONNX Runtime >= 1.24; pinned to the latest stable release at
+/// the time of the fastembed 4->6 bump).
+const ORT_VERSION: &str = "1.29.0";
 
 const ORT_DYLIB_ENV: &str = "ORT_DYLIB_PATH";
 
@@ -43,7 +48,14 @@ struct Target {
 }
 
 /// Resolve the onnxruntime asset for a given `(os, arch)`, or `None` if
-/// unsupported (Windows-on-ARM and exotic arches are deferred — issue #345).
+/// unsupported. Windows-on-ARM and exotic arches are deferred (issue #345).
+/// `macos`/`x86_64` (Intel Mac) is deferred too as of the 1.29.0 pin: upstream
+/// onnxruntime stopped publishing `osx-x86_64` prebuilt archives starting
+/// with the first release in our required range (1.24.0) — confirmed no
+/// release from 1.24.0 through 1.29.0 ships one. An Intel-Mac
+/// `embeddings-dynamic` build still works via an explicit `ORT_DYLIB_PATH`
+/// to a self-built or Homebrew onnxruntime; only the automatic
+/// download-on-first-use path is unavailable.
 /// Split out from [`detect_target`] so the target table is unit-testable across
 /// platforms from any host.
 fn target_for(os: &str, arch: &str) -> Option<Target> {
@@ -52,28 +64,23 @@ fn target_for(os: &str, arch: &str) -> Option<Target> {
     let (asset, sha256, approx_size) = match (os, arch) {
         ("macos", "aarch64") => (
             "osx-arm64",
-            "b678fc3c2354c771fea4fba420edeccfba205140088334df801e7fc40e83a57a",
-            "~7 MB",
-        ),
-        ("macos", "x86_64") => (
-            "osx-x86_64",
-            "0f73006813af2a1a5d1723ed7dfb694fc629d15037124081bb61b7bf7d99fc78",
-            "~7 MB",
+            "d0706fc34f315d8c88639d0a8c81f2e09e815f282cabed3493c06a054352cf92",
+            "~40 MB",
         ),
         ("linux", "x86_64") => (
             "linux-x64",
-            "67db4dc1561f1e3fd42e619575c82c601ef89849afc7ea85a003abbac1a1a105",
-            "~7 MB",
+            "c3fddc4f139a045b0c4902c57410f0694f1c2fdf9b6939fbe38b1aeae7cd14ba",
+            "~11 MB",
         ),
         ("linux", "aarch64") => (
             "linux-aarch64",
-            "ae4fedbdc8c18d688c01306b4b50c63de3445cdf2dbd720e01a2fa3810b8106a",
-            "~7 MB",
+            "e1799098ebc054b370f6176a450f158720f297818c613e5dc99b92e2ec82346f",
+            "~10 MB",
         ),
         ("windows", "x86_64") => (
             "win-x64",
-            "78d447051e48bd2e1e778bba378bec4ece11191c9e538cf7b2c4a4565e8f5581",
-            "~65 MB",
+            "c9b4b7086b529ad814f428c1bad028e20a25d7dc0699836775faace4ab5b78b2",
+            "~76 MB",
         ),
         _ => return None,
     };
@@ -490,12 +497,12 @@ mod tests {
         let mut builder = tar::Builder::new(Vec::new());
         tar_entry(
             &mut builder,
-            "onnxruntime-osx-arm64-1.20.1/lib/libonnxruntime_providers_shared.dylib",
+            "onnxruntime-osx-arm64-1.29.0/lib/libonnxruntime_providers_shared.dylib",
             b"PROVIDER",
         );
         tar_entry(
             &mut builder,
-            "onnxruntime-osx-arm64-1.20.1/lib/libonnxruntime.1.20.1.dylib",
+            "onnxruntime-osx-arm64-1.29.0/lib/libonnxruntime.1.29.0.dylib",
             b"REAL-LIBRARY-BYTES",
         );
         let tar_bytes = builder.into_inner().unwrap();
@@ -520,13 +527,6 @@ mod tests {
                 "libonnxruntime.dylib",
                 "osx-arm64",
             ),
-            (
-                "macos",
-                "x86_64",
-                "tgz",
-                "libonnxruntime.dylib",
-                "osx-x86_64",
-            ),
             ("linux", "x86_64", "tgz", "libonnxruntime.so", "linux-x64"),
             (
                 "linux",
@@ -546,14 +546,18 @@ mod tests {
             assert_eq!(t.sha256.len(), 64, "{os}/{arch} sha must be 64 hex chars");
         }
         // Windows-on-ARM and exotic arches are deferred (issue #345).
+        // Intel Mac: upstream onnxruntime stopped shipping osx-x86_64
+        // prebuilt archives at 1.24.0, our minimum supported version — see
+        // `target_for`'s docs.
         assert!(target_for("windows", "aarch64").is_none());
         assert!(target_for("freebsd", "x86_64").is_none());
+        assert!(target_for("macos", "x86_64").is_none());
     }
 
     #[test]
     fn is_onnxruntime_lib_excludes_provider_siblings() {
-        assert!(is_onnxruntime_lib("libonnxruntime.1.20.1.dylib"));
-        assert!(is_onnxruntime_lib("libonnxruntime.so.1.20.1"));
+        assert!(is_onnxruntime_lib("libonnxruntime.1.29.0.dylib"));
+        assert!(is_onnxruntime_lib("libonnxruntime.so.1.29.0"));
         assert!(is_onnxruntime_lib("onnxruntime.dll"));
         // The providers siblings must never be picked.
         assert!(!is_onnxruntime_lib("libonnxruntime_providers_shared.dylib"));
@@ -573,12 +577,12 @@ mod tests {
             let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
             let opts = SimpleFileOptions::default();
             w.start_file(
-                "onnxruntime-win-x64-1.20.1/lib/onnxruntime_providers_shared.dll",
+                "onnxruntime-win-x64-1.29.0/lib/onnxruntime_providers_shared.dll",
                 opts,
             )
             .unwrap();
             w.write_all(b"PROVIDER").unwrap();
-            w.start_file("onnxruntime-win-x64-1.20.1/lib/onnxruntime.dll", opts)
+            w.start_file("onnxruntime-win-x64-1.29.0/lib/onnxruntime.dll", opts)
                 .unwrap();
             w.write_all(b"REAL-DLL-BYTES").unwrap();
             w.finish().unwrap();
@@ -598,7 +602,7 @@ mod tests {
         let victim = tmp_dir.path().join("victim.txt");
         std::fs::write(&victim, "untouched").unwrap();
 
-        let target = tmp_dir.path().join("libonnxruntime.1.20.1.dylib.new");
+        let target = tmp_dir.path().join("libonnxruntime.1.29.0.dylib.new");
         std::os::unix::fs::symlink(&victim, &target).unwrap();
 
         write_lib_tmp(&target, b"verified library bytes").unwrap();
@@ -621,7 +625,7 @@ mod tests {
     #[test]
     fn write_lib_tmp_creates_a_fresh_file() {
         let tmp_dir = tempfile::TempDir::new().unwrap();
-        let target = tmp_dir.path().join("libonnxruntime.1.20.1.dylib.new");
+        let target = tmp_dir.path().join("libonnxruntime.1.29.0.dylib.new");
         write_lib_tmp(&target, b"payload").unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"payload");
     }
