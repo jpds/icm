@@ -45,7 +45,7 @@ pub use error::{IcmError, IcmResult};
 pub use facts::{Fact, FactsStats};
 pub use facts_store::FactsStore;
 #[cfg(feature = "embeddings")]
-pub use fastembed_embedder::FastEmbedder;
+pub use fastembed_embedder::{FastEmbedder, DEFAULT_MODEL as DEFAULT_EMBEDDING_MODEL};
 pub use feedback::{Feedback, FeedbackStats};
 pub use feedback_store::FeedbackStore;
 pub use memoir::{Concept, ConceptLink, Label, Memoir, MemoirStats, Relation};
