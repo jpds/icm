@@ -5387,6 +5387,27 @@ Do this BEFORE responding to the user. Not after. Not later. Immediately.\n\
 \n\
 Do NOT store: trivial details, info already in this file, ephemeral state (build logs, git status).\n\
 \n\
+### Memoirs (permanent knowledge graphs)\n\
+Use memoirs for durable, structured knowledge that outlasts individual memories.\n\
+```bash\n\
+icm memoir create -n \"my-memoir\" -d \"Description\"   # create knowledge container\n\
+icm memoir add-concept -m \"my-memoir\" -n \"concept\" \\\n\
+  -d \"Dense definition\" -l \"type:decision,domain:arch\" # add concept with labels\n\
+icm memoir link -m \"my-memoir\" --from \"a\" --to \"b\" \\\n\
+  -r depends-on                                        # link concepts (relations:\n\
+                                                       # part-of, depends-on, related-to,\n\
+                                                       # contradicts, refines,\n\
+                                                       # alternative-to, caused-by,\n\
+                                                       # instance-of, superseded-by)\n\
+icm memoir export -m \"my-memoir\" -f ai                # dump as LLM-ready markdown\n\
+icm memoir search -m \"my-memoir\" \"query\"              # full-text search concepts\n\
+icm memoir list                                        # list all memoirs\n\
+icm memoir show \"my-memoir\"                            # stats + concept list\n\
+icm memoir inspect --memoir \"my-memoir\" \"concept\"      # full definition + graph\n\
+icm memoir refine --memoir \"my-memoir\" --name \"concept\" \\\n\
+  --definition \"new text\"                              # update concept (bumps revision)\n\
+```\n\
+\n\
 ### Other commands\n\
 ```bash\n\
 icm forget <id>                          # remove a memory by ID\n\
