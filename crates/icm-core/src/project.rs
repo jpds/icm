@@ -1,9 +1,9 @@
 //! Canonical project-name detection, shared by every surface that tags or
 //! filters memories by project (CLI hooks, MCP recall, HTTP API).
 //!
-//! Audit finding: the CLI hooks derived the project from the git remote
-//! (worktree- and rename-proof) while the MCP server used the cwd basename —
-//! so a renamed checkout stored memories under one project name and recalled
+//! The CLI hooks used to derive the project from the git remote (worktree-
+//! and rename-proof) while the MCP server used the cwd basename. A renamed
+//! checkout could then store memories under one project name and recall
 //! under another, silently returning nothing. Both sides now share this
 //! module.
 
@@ -12,9 +12,12 @@
 /// slash-SSH ("git@github.com:user/repo.git"), and
 /// colon-only SSH ("git@host:repo.git") formats.
 pub fn repo_name_from_url(url: &str) -> Option<String> {
+    // A trailing slash would otherwise make the final `/`-segment empty and
+    // defeat remote detection (e.g. "https://host/user/repo/").
+    let trimmed = url.trim_end_matches('/');
     // rsplit('/') always yields ≥1 element; split on ':' afterwards to
     // handle SCP-style SSH URLs that have no slash before the repo name.
-    let after_slash = url.rsplit('/').next().unwrap_or(url);
+    let after_slash = trimmed.rsplit('/').next().unwrap_or(trimmed);
     let name = after_slash
         .rsplit(':')
         .next()
@@ -30,45 +33,44 @@ pub fn repo_name_from_url(url: &str) -> Option<String> {
 /// Extract a project name from a filesystem path (basename), treating empty
 /// or root paths as "no project".
 pub fn project_from_path(path: &str) -> Option<String> {
+    let p = std::path::Path::new(path);
+
     if path.is_empty() {
         return None;
     }
-    let p = std::path::Path::new(path);
 
-    // Try git remote get-url origin (most unique identifier)
-    if let Ok(out) = std::process::Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(p)
-        .output()
-    {
-        if out.status.success() {
-            let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if let Some(name) = repo_name_from_url(&url) {
-                return Some(name);
-            }
-        }
-    }
-
-    // For worktrees without a remote: git-common-dir returns the main repo's
-    // .git as an absolute path, so its parent basename is the real project name.
-    if let Ok(out) = std::process::Command::new("git")
-        .args(["rev-parse", "--git-common-dir"])
-        .current_dir(p)
-        .output()
-    {
-        if out.status.success() {
-            let raw = out.stdout;
-            let common = std::str::from_utf8(&raw).unwrap_or("").trim();
-            let common_path = std::path::Path::new(common);
-            if common_path.is_absolute() {
-                if let Some(name) = common_path.parent().and_then(|r| r.file_name()) {
-                    return Some(name.to_string_lossy().to_string());
+    if let Ok(repo) = gix::discover(p) {
+        // Prefer origin remote URL: the most unique identifier, stable
+        // across worktrees and renamed checkouts.
+        if let Ok(remote) = repo.find_remote("origin") {
+            if let Some(url) = remote.url(gix::remote::Direction::Fetch) {
+                let url_str = url.to_bstring().to_string();
+                if let Some(name) = repo_name_from_url(&url_str) {
+                    return Some(name);
                 }
             }
         }
+
+        // Worktree fallback: common_dir() always points to the main repo's
+        // .git, so its parent is the main repo root regardless of worktree
+        // depth. canonicalize resolves `..` components that gix leaves in
+        // the path for linked worktrees (git_dir.join("../..") from the
+        // commondir file).
+        let common = repo.common_dir();
+        let canon;
+        let common = match std::fs::canonicalize(common) {
+            Ok(c) => {
+                canon = c;
+                canon.as_path()
+            }
+            Err(_) => common,
+        };
+        if let Some(name) = common.parent().and_then(|r| r.file_name()) {
+            return Some(name.to_string_lossy().to_string());
+        }
     }
 
-    // Fallback: basename of the path itself
+    // Last resort: basename of the path itself.
     p.file_name().map(|n| n.to_string_lossy().to_string())
 }
 
@@ -107,7 +109,7 @@ mod tests {
             .current_dir(dir.path())
             .output()
             .unwrap();
-        // tempdir basename is a random name, not "myproject" — remote must win
+        // tempdir basename is a random name, not "myproject", so the remote wins
         assert_eq!(
             project_from_path(dir.path().to_str().unwrap()),
             Some("myproject".into())
@@ -154,8 +156,8 @@ mod tests {
     }
 
     /// Creates a git repo named "mainproject" with a worktree at "w1".
-    /// Returns `(base_tempdir, worktree_path)` — keep `base` alive for the
-    /// lifetime of the test or git will clean up the underlying directory.
+    /// Returns `(base_tempdir, worktree_path)`. Keep `base` alive for the
+    /// lifetime of the test, or git cleans up the underlying directory.
     fn make_worktree() -> (tempfile::TempDir, std::path::PathBuf) {
         let base = tempfile::tempdir().unwrap();
         let main_repo = base.path().join("mainproject");
@@ -188,6 +190,26 @@ mod tests {
         assert_eq!(
             project_from_path(worktree.to_str().unwrap()),
             Some("mainproject".into())
+        );
+    }
+
+    #[test]
+    fn project_from_path_uses_repo_name_for_remote_less_subdir() {
+        let base = tempfile::tempdir().unwrap();
+        let repo = base.path().join("norepo");
+        std::fs::create_dir(&repo).unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        let subdir = repo.join("docs");
+        std::fs::create_dir(&subdir).unwrap();
+        // No origin remote, so common_dir must resolve to the repo root
+        // (not the subdirectory basename).
+        assert_eq!(
+            project_from_path(subdir.to_str().unwrap()),
+            Some("norepo".into())
         );
     }
 }

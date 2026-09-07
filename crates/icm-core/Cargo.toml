@@ -27,6 +27,7 @@ fastembed = { workspace = true, optional = true }
 directories = { workspace = true, optional = true }
 cachedir = { workspace = true, optional = true }
 tracing = { workspace = true }
+gix = { workspace = true }
 
 # Unix-only: used by the load-dynamic embeddings build to pre-flight the
 # onnxruntime dylib (dlopen) before ort initializes. See issue #345.
