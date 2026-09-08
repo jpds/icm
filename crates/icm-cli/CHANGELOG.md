@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.10.64](https://github.com/rtk-ai/icm/compare/icm-v0.10.63...icm-v0.10.64) (2026-09-08)
+
+
+### Features
+
+* **consolidate:** async consolidation queue for LLM-backed summarization ([#179](https://github.com/rtk-ai/icm/issues/179)) ([#444](https://github.com/rtk-ai/icm/issues/444)) ([4e370e9](https://github.com/rtk-ai/icm/commit/4e370e955494b35dd1a91bcbbccb6abdf4b6ed19))
+* **embeddings:** bump fastembed 4-&gt;6, switch default model to e5-large ([60f7acd](https://github.com/rtk-ai/icm/commit/60f7acd89d90f851d3e558c4b1b8aa2f63abddf5))
+* **store:** hierarchical database path resolution with per-project support ([#450](https://github.com/rtk-ai/icm/issues/450)) ([1db45d2](https://github.com/rtk-ai/icm/commit/1db45d26ebfb2b965050a91d9733a99bf2de0243))
+
+
+### Bug Fixes
+
+* **cli:** file extract-pending facts under each row's project ([#454](https://github.com/rtk-ai/icm/issues/454)) ([dfbe322](https://github.com/rtk-ai/icm/commit/dfbe32217af7a0e88196a4c68784268f257d6cd3))
+* **embeddings:** pin onnxruntime 1.29.0 for the load-dynamic build ([4994731](https://github.com/rtk-ai/icm/commit/499473134e51fb6736eadce6ed6efab8d884c06d))
+* **init:** document memoir commands in CLAUDE.md instruction block ([#435](https://github.com/rtk-ai/icm/issues/435)) ([cf9c265](https://github.com/rtk-ai/icm/commit/cf9c265637544dd928ba3770eca3d02d79e341a2))
+* **init:** replace hand-rolled PATH lookup with the which crate ([#455](https://github.com/rtk-ai/icm/issues/455)) ([64d97ba](https://github.com/rtk-ai/icm/commit/64d97ba75d3c6a6968798043ca7503f8f0fbb5d0))
+* **recall:** CLI recall starves under a topic/project/keyword filter ([5f24e03](https://github.com/rtk-ai/icm/commit/5f24e03a904fb8111ff583ac726e25cbd22d8fbd))
+* **store,recall:** dedup data loss, FTS AND-&gt;OR, topic starvation, e5-large default ([71aad95](https://github.com/rtk-ai/icm/commit/71aad95dfbca63b569ffcb97d312ddf0d3fdceba))
+* **store:** stop dedup merge from silently overwriting distinct memories ([95dfd5f](https://github.com/rtk-ai/icm/commit/95dfd5f3dbfa82cbc070f2d7aa1a05c8dd281e10))
+
 ## [0.10.63](https://github.com/rtk-ai/icm/compare/icm-v0.10.62...icm-v0.10.63) (2026-08-26)
 
 
