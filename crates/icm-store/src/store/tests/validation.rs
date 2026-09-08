@@ -24,6 +24,23 @@ fn test_sanitize_fts_query() {
     );
 }
 
+/// `search_hybrid`'s FTS component uses OR-joined tokens instead of
+/// `sanitize_fts_query`'s AND join: same tokenization, `" OR "` between
+/// tokens rather than `" "`, so a multi-word natural-language question
+/// still contributes a BM25 signal from any single shared word.
+#[test]
+fn test_sanitize_fts_query_any() {
+    assert_eq!(
+        sanitize_fts_query_any("hello world"),
+        "\"hello\" OR \"world\""
+    );
+    assert_eq!(sanitize_fts_query_any(""), "");
+    assert_eq!(
+        sanitize_fts_query_any("no-such column:vec"),
+        "\"no\" OR \"such\" OR \"column\" OR \"vec\""
+    );
+}
+
 #[test]
 fn test_search_fts_special_chars() {
     let store = test_store();

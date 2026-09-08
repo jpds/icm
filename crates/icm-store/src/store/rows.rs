@@ -137,8 +137,11 @@ pub(crate) fn truncate_at_char_boundary(s: &str, max: usize) -> &str {
     &s[..cut]
 }
 
-/// This function strips special chars and wraps each token in double quotes.
-pub(crate) fn sanitize_fts_query(query: &str) -> String {
+/// Strip FTS5 operator chars and return each surviving token wrapped in
+/// double quotes (so token content is never parsed as FTS5 syntax).
+/// Shared by [`sanitize_fts_query`] (AND join) and
+/// [`sanitize_fts_query_any`] (OR join).
+fn quoted_fts_tokens(query: &str) -> Vec<String> {
     // Limit input length to prevent abuse (UTF-8 safe truncation)
     let query = if query.len() > 10_000 {
         let mut end = 10_000;
@@ -166,7 +169,7 @@ pub(crate) fn sanitize_fts_query(query: &str) -> String {
         })
         .collect();
 
-    let tokens: Vec<String> = cleaned
+    cleaned
         .split_whitespace()
         .filter(|w| !w.is_empty())
         .take(100) // Limit token count to prevent excessive query complexity
@@ -175,8 +178,31 @@ pub(crate) fn sanitize_fts_query(query: &str) -> String {
             let stripped = w.replace('"', "");
             format!("\"{stripped}\"")
         })
-        .collect();
-    tokens.join(" ")
+        .collect()
+}
+
+/// This function strips special chars and wraps each token in double quotes,
+/// AND-joined (FTS5's default when tokens are merely adjacent): every token
+/// must match. Intended for literal/precise lookups (plain FTS fallback,
+/// feedback and memoir search).
+pub(crate) fn sanitize_fts_query(query: &str) -> String {
+    quoted_fts_tokens(query).join(" ")
+}
+
+/// Same tokenization as [`sanitize_fts_query`], OR-joined: any token
+/// matching is enough.
+///
+/// For a natural-language question ("What does Melanie do with her family
+/// on hikes?" -> 8+ tokens), AND-joining effectively kills FTS5 recall —
+/// no single short dialogue turn contains every query word, so the FTS
+/// side of a hybrid vector+FTS blend contributes ~0 regardless of its
+/// weight, silently reducing "hybrid search" to vector-only. OR-joining
+/// lets a turn that shares just the distinctive words ("hikes", "family")
+/// score via BM25 too, which is the actual point of blending FTS with
+/// vector similarity. Used by `search_hybrid`'s FTS component only — the
+/// precise-lookup call sites keep AND semantics.
+pub(crate) fn sanitize_fts_query_any(query: &str) -> String {
+    quoted_fts_tokens(query).join(" OR ")
 }
 
 /// Whether `e` is FTS5 rejecting a malformed MATCH query (e.g. "hello AND",

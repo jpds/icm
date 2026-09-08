@@ -295,6 +295,45 @@ enum Commands {
         dry_run: bool,
     },
 
+    /// Process the async consolidation queue (LLM-backed, issue #179).
+    /// Drains topics enqueued by the auto-consolidate path when
+    /// `consolidate.summarizer.provider != none` (which skips the
+    /// synchronous ~10-15s LLM call on the hot store path). Designed to
+    /// be invoked from a cron, the SessionEnd async fork, or manually.
+    ConsolidatePending {
+        /// Maximum jobs to process in this run.
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+
+        /// Optional CLI override of `consolidate.summarizer.provider`.
+        #[arg(long)]
+        provider: Option<String>,
+
+        /// Optional CLI override of `consolidate.summarizer.model`.
+        #[arg(long)]
+        model: Option<String>,
+
+        /// Don't actually call the LLM — just print what would be sent.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// List async consolidation jobs (issue #179) — pending, done, or
+    /// failed, with the captured error for failures.
+    ConsolidateJobs {
+        /// Filter by status: pending | done | failed. All statuses when omitted.
+        #[arg(long)]
+        status: Option<String>,
+
+        /// Maximum rows to show.
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
+
+        /// Reset a `failed` job back to `pending` so the next drain retries it.
+        #[arg(long, value_name = "ID")]
+        retry: Option<String>,
+    },
+
     /// Apply temporal decay to memory weights
     Decay {
         /// Decay factor (default: 0.95)
@@ -410,7 +449,8 @@ enum Commands {
 
         /// Also write project-level instruction files into the current
         /// directory (`CLAUDE.md`, `AGENTS.md`, `.windsurfrules`,
-        /// `.aider.conventions.md`, `.github/copilot-instructions.md`).
+        /// `.aider.conventions.md`, `.github/copilot-instructions.md`)
+        /// and set up a project-local database under `.icm/`.
         /// Default behavior writes only to global per-tool paths
         /// (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, etc.) so init
         /// doesn't pollute every project tree.
@@ -1518,21 +1558,108 @@ fn default_db_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("memories.db"))
 }
 
-fn open_store(db: Option<PathBuf>, embedding_dims: usize) -> Result<Store> {
-    let path = db.unwrap_or_else(default_db_path);
-    Store::with_dims(&path, embedding_dims).context("failed to open database")
+/// Detect the project root (git repository root) from the current directory.
+fn detect_project_root() -> Option<PathBuf> {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()
+        .and_then(|output| {
+            if output.status.success() {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if path.is_empty() {
+                    None
+                } else {
+                    Some(PathBuf::from(path))
+                }
+            } else {
+                None
+            }
+        })
+}
+
+/// Resolve database path using hierarchical resolution:
+///
+/// 1. `--db` CLI flag (highest priority)
+/// 2. `$ICM_DB` environment variable
+/// 3. Global config `[store].path` from config file
+/// 4. Project-local `.icm/config.toml` `[store].path` at git root
+/// 5. Project-local `.icm/memories.db` at git root (if file exists)
+/// 6. Default platform data directory
+fn resolve_db_path(cli_db: Option<PathBuf>, cfg: &config::Config) -> PathBuf {
+    // 1. --db CLI flag
+    if let Some(db) = cli_db {
+        return db;
+    }
+
+    // 2. $ICM_DB env var
+    if let Ok(env_db) = std::env::var("ICM_DB") {
+        let path = PathBuf::from(env_db);
+        if !path.as_os_str().is_empty() {
+            return path;
+        }
+    }
+
+    // 3. Global config [store].path
+    if let Some(config_path) = &cfg.store.path {
+        let path = PathBuf::from(config_path);
+        if !path.as_os_str().is_empty() {
+            return path;
+        }
+    }
+
+    // 4. Project-local .icm/ directory (at git root)
+    if let Some(project_root) = detect_project_root() {
+        let icm_dir = project_root.join(".icm");
+        if icm_dir.is_dir() {
+            // 4a. .icm/config.toml with [store].path
+            let project_cfg = icm_dir.join("config.toml");
+            if project_cfg.exists() {
+                if let Ok(content) = std::fs::read_to_string(&project_cfg) {
+                    if let Ok(value) = content.parse::<toml::Value>() {
+                        if let Some(path_str) = value
+                            .get("store")
+                            .and_then(|s| s.get("path"))
+                            .and_then(|p| p.as_str())
+                        {
+                            let path = if Path::new(path_str).is_absolute() {
+                                PathBuf::from(path_str)
+                            } else {
+                                project_root.join(path_str)
+                            };
+                            if !path.as_os_str().is_empty() {
+                                return path;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 4b. .icm/memories.db (if file exists)
+            let project_db = icm_dir.join("memories.db");
+            if project_db.exists() {
+                return project_db;
+            }
+        }
+    }
+
+    // 5. Default platform data dir
+    default_db_path()
+}
+
+fn open_store(db: PathBuf, embedding_dims: usize) -> Result<Store> {
+    Store::with_dims(&db, embedding_dims).context("failed to open database")
 }
 
 /// Open the store and, if `backup_cfg.enabled`, trigger an automatic backup
 /// when the last backup is older than `interval_days`. Backup errors are
 /// logged as warnings — they must not block the normal workflow.
 fn open_store_with_backup(
-    db: Option<PathBuf>,
+    path: PathBuf,
     embedding_dims: usize,
     backup_cfg: &crate::config::BackupConfig,
 ) -> Result<Store> {
-    let path = db.clone().unwrap_or_else(default_db_path);
-    let store = open_store(db, embedding_dims)?;
+    let store = open_store(path.clone(), embedding_dims)?;
 
     if backup_cfg.enabled && path.exists() {
         if backup_cfg.keep_backups == 0 {
@@ -1670,8 +1797,7 @@ fn cmd_backup(db_path: &std::path::Path, output: Option<&std::path::Path>) -> Re
 /// the same way as [`open_store`] and rejects with a helpful message
 /// if the DB doesn't exist yet — read-only mode cannot bootstrap a
 /// fresh DB.
-fn open_store_readonly(db: Option<PathBuf>) -> Result<Store> {
-    let path = db.unwrap_or_else(default_db_path);
+fn open_store_readonly(path: PathBuf) -> Result<Store> {
     Store::open_readonly(&path).with_context(|| {
         format!(
             "failed to open database read-only at {} \
@@ -1707,14 +1833,13 @@ fn read_only_requested(cli_flag: bool) -> bool {
 ///    `DEFAULT_EMBEDDING_DIMS` (fresh install, nothing to lose).
 fn resolve_embedding_dims(
     embedder: Option<&dyn icm_core::Embedder>,
-    cli_db: Option<&PathBuf>,
+    db_path: &Path,
     _cfg: &crate::config::Config,
 ) -> usize {
     if let Some(e) = embedder {
         return e.dimensions();
     }
-    let path = cli_db.cloned().unwrap_or_else(default_db_path);
-    match Store::read_stored_embedding_dims(&path) {
+    match Store::read_stored_embedding_dims(db_path) {
         Ok(Some(dims)) => dims,
         // No DB or no metadata row → fresh install path; default is safe.
         Ok(None) => icm_core::DEFAULT_EMBEDDING_DIMS,
@@ -1726,7 +1851,7 @@ fn resolve_embedding_dims(
             tracing::warn!(
                 "could not peek stored embedding dims at {} ({}); \
                  falling back to DEFAULT_EMBEDDING_DIMS",
-                path.display(),
+                db_path.display(),
                 e,
             );
             icm_core::DEFAULT_EMBEDDING_DIMS
@@ -1864,11 +1989,6 @@ fn main() -> Result<()> {
     } else {
         None
     };
-    let embedding_dims = resolve_embedding_dims(
-        embedder.as_ref().map(|e| e as &dyn icm_core::Embedder),
-        cli.db.first(),
-        &cfg,
-    );
     // Audit #185 medium: reject `--db A ... --db B` (or with `=`)
     // instead of silently letting the last occurrence win. Clap
     // alone doesn't catch the parent+subcommand split case (the
@@ -1890,11 +2010,19 @@ fn main() -> Result<()> {
         }
     }
     let cli_db: Option<PathBuf> = cli.db.into_iter().next();
-    // `db_path` feeds the extract-pending worker lock (#322) and some
+    // `db_path` centralizes hierarchical resolution (issue #257): --db flag,
+    // $ICM_DB env var, global config, project-local .icm/, then the platform
+    // default. It feeds the extract-pending worker lock (#322), doctor/repair/
+    // backup (which bypass the normal store open below), and some
     // feature-gated commands (e.g. the embeddings-only `embed`); it can be
     // unused in the leanest builds.
     #[allow(unused_variables)]
-    let db_path = cli_db.clone().unwrap_or_else(default_db_path);
+    let db_path = resolve_db_path(cli_db.clone(), &cfg);
+    let embedding_dims = resolve_embedding_dims(
+        embedder.as_ref().map(|e| e as &dyn icm_core::Embedder),
+        &db_path,
+        &cfg,
+    );
 
     // `icm uninstall` must NOT open the SQLite store: a default
     // `open_store` call would recreate the DB directory and WAL/SHM files
@@ -1942,7 +2070,7 @@ fn main() -> Result<()> {
         );
         let mut reader = open_export_reader(from_export)?;
         let dims = peek_export_embedding_dims(&mut reader).unwrap_or(embedding_dims);
-        let store = open_store_with_backup(cli_db.clone(), dims, &cfg.store.backup)?;
+        let store = open_store_with_backup(db_path.clone(), dims, &cfg.store.backup)?;
         return cmd_import_from_export(&store, reader, dry_run);
     }
     if let Commands::Import {
@@ -1953,7 +2081,7 @@ fn main() -> Result<()> {
     {
         let mut reader = open_export_reader(src)?;
         let dims = peek_export_embedding_dims(&mut reader).unwrap_or(embedding_dims);
-        let store = open_store_with_backup(cli_db.clone(), dims, &cfg.store.backup)?;
+        let store = open_store_with_backup(db_path.clone(), dims, &cfg.store.backup)?;
         return cmd_import_from_export(&store, reader, dry_run);
     }
     // `icm hook disable` only edits AI-tool settings files — it needs neither
@@ -1972,9 +2100,9 @@ fn main() -> Result<()> {
     }
 
     let store = if read_only_requested(cli.read_only) {
-        open_store_readonly(cli_db)?
+        open_store_readonly(db_path.clone())?
     } else {
-        open_store_with_backup(cli_db, embedding_dims, &cfg.store.backup)?
+        open_store_with_backup(db_path.clone(), embedding_dims, &cfg.store.backup)?
     };
 
     match command {
@@ -1993,6 +2121,7 @@ fn main() -> Result<()> {
                 &store,
                 emb_ref,
                 &cfg.memory,
+                &cfg.consolidate,
                 topic,
                 content,
                 importance.into(),
@@ -2014,6 +2143,7 @@ fn main() -> Result<()> {
                 &store,
                 emb_ref,
                 &cfg.memory,
+                &cfg.consolidate,
                 content,
                 topic,
                 importance.into(),
@@ -2241,6 +2371,29 @@ fn main() -> Result<()> {
                 emb_ref,
             )
         }
+        Commands::ConsolidatePending {
+            limit,
+            provider,
+            model,
+            dry_run,
+        } => {
+            let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+            cmd_consolidate_pending(
+                &store,
+                emb_ref,
+                &cfg.consolidate.summarizer,
+                limit,
+                provider.as_deref(),
+                model.as_deref(),
+                dry_run,
+                &db_path,
+            )
+        }
+        Commands::ConsolidateJobs {
+            status,
+            limit,
+            retry,
+        } => cmd_consolidate_jobs(&store, status.as_deref(), limit, retry.as_deref()),
         Commands::Embed {
             topic,
             force,
@@ -2310,7 +2463,7 @@ fn main() -> Result<()> {
             force,
             per_project,
             with_codex_post_hook,
-        } => cmd_init(mode, force, per_project, with_codex_post_hook),
+        } => cmd_init(mode, force, per_project, with_codex_post_hook, &db_path),
         // Doctor, Repair and Backup are dispatched before `open_store` above;
         // these arms exist only for match exhaustiveness and are unreachable.
         Commands::Doctor => unreachable!("dispatched before open_store"),
@@ -2415,6 +2568,7 @@ fn main() -> Result<()> {
                 &store,
                 emb_ref,
                 &cfg.memory,
+                &cfg.consolidate,
                 &content,
                 importance.into(),
                 keywords,
@@ -2428,7 +2582,7 @@ fn main() -> Result<()> {
             println!("{result}");
             Ok(())
         }
-        Commands::Config => cmd_config(),
+        Commands::Config => cmd_config(cli_db, &cfg),
         Commands::Upgrade { apply, check } => upgrade::cmd_upgrade(apply, check),
         #[cfg(feature = "bench")]
         Commands::Bench { count } => cmd_bench(count),
@@ -2485,7 +2639,14 @@ fn main() -> Result<()> {
                     enabled: cfg.memory.auto_consolidate_enabled,
                     threshold: cfg.memory.auto_consolidate_threshold,
                 };
-                return http_api::run_http_server(store, boxed_emb, addr, token, auto_consolidate);
+                return http_api::run_http_server(
+                    store,
+                    boxed_emb,
+                    addr,
+                    token,
+                    auto_consolidate,
+                    cfg.mcp.instructions.clone(),
+                );
             }
             #[cfg(feature = "embeddings")]
             let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
@@ -2501,7 +2662,13 @@ fn main() -> Result<()> {
                 enabled: cfg.memory.auto_consolidate_enabled,
                 threshold: cfg.memory.auto_consolidate_threshold,
             };
-            icm_mcp::run_server(&store, emb_ref, use_compact, auto_consolidate)
+            icm_mcp::run_server(
+                &store,
+                emb_ref,
+                use_compact,
+                auto_consolidate,
+                cfg.mcp.instructions.as_deref(),
+            )
         }
         Commands::HookLog {
             limit,
@@ -2539,6 +2706,7 @@ fn main() -> Result<()> {
                         &store,
                         emb_ref,
                         &cfg.memory,
+                        &cfg.consolidate,
                         extract_every,
                         &cfg.extraction,
                         &cfg.archive,
@@ -2549,7 +2717,7 @@ fn main() -> Result<()> {
                     let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
                     #[cfg(not(feature = "embeddings"))]
                     let emb_ref: Option<&dyn icm_core::Embedder> = None;
-                    cmd_hook_compact(&store, emb_ref, &cfg.memory)
+                    cmd_hook_compact(&store, emb_ref, &cfg.memory, &cfg.consolidate)
                 }
                 HookCommands::Prompt => cmd_hook_prompt(&store, &cfg.archive),
                 HookCommands::Start { max_tokens } => {
@@ -2565,7 +2733,13 @@ fn main() -> Result<()> {
                     let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
                     #[cfg(not(feature = "embeddings"))]
                     let emb_ref: Option<&dyn icm_core::Embedder> = None;
-                    cmd_hook_end(&store, emb_ref, &cfg.memory, &cfg.extraction.summarizer)
+                    cmd_hook_end(
+                        &store,
+                        emb_ref,
+                        &cfg.memory,
+                        &cfg.consolidate,
+                        &cfg.extraction.summarizer,
+                    )
                 }
                 // Dispatched before `open_store`; this arm only exists for
                 // match exhaustiveness and is unreachable.
@@ -2622,10 +2796,40 @@ fn maybe_auto_consolidate(
     embedder: Option<&dyn icm_core::Embedder>,
     topic: &str,
     cfg: &crate::config::MemoryConfig,
+    consolidate_cfg: &crate::config::ConsolidateConfig,
 ) {
     if !cfg.auto_consolidate_enabled {
         return;
     }
+
+    // Issue #179: with an LLM summarizer configured, the synchronous
+    // consolidation below would block the hot store path for ~10-15s
+    // (a `claude -p` round trip) — fine on demand (`icm consolidate`),
+    // unacceptable inline on every `store()`/hook fire. Enqueue instead
+    // and let `icm consolidate-pending` (or the SessionEnd async fork)
+    // do the LLM call off the critical path. Lexical (`provider = "none"`,
+    // the default) keeps running inline — zero behavior change.
+    //
+    // Threshold check happens here, before enqueueing — otherwise every
+    // single store() would queue a job regardless of topic size, and
+    // `auto_consolidate_with_embedder`'s own no-op-below-threshold guard
+    // never gets a chance to run (it's skipped entirely on this branch).
+    if consolidate_cfg.summarizer.provider != "none" {
+        match store.count_by_topic(topic) {
+            Ok(n) if n > cfg.auto_consolidate_threshold => {
+                match store.enqueue_pending_consolidation(topic, "") {
+                    Ok(_) => eprintln!("[icm] enqueued topic '{topic}' for async consolidation"),
+                    Err(e) => {
+                        tracing::warn!("enqueue consolidation failed for topic '{topic}': {e}")
+                    }
+                }
+            }
+            Ok(_) => {} // below threshold — no-op, same as the sync path
+            Err(e) => tracing::warn!("count_by_topic failed for '{topic}': {e}"),
+        }
+        return;
+    }
+
     match store.auto_consolidate_with_embedder(topic, cfg.auto_consolidate_threshold, embedder) {
         Ok(true) => eprintln!(
             "[icm] auto-consolidated topic '{topic}' (exceeded {} entries)",
@@ -2641,6 +2845,7 @@ fn cmd_store(
     store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
     memory_cfg: &crate::config::MemoryConfig,
+    consolidate_cfg: &crate::config::ConsolidateConfig,
     topic: String,
     content: String,
     importance: Importance,
@@ -2678,13 +2883,14 @@ fn cmd_store(
                 access_count: existing.access_count,
                 weight: 1.0,
                 topic: existing.topic.clone(),
-                summary: memory.summary.clone(),
+                // Never wholesale-replace: `existing` and `memory` are only
+                // known to be semantically close (cosine similarity), not
+                // the same statement — see `merge_summaries`'s docs for a
+                // measured case (two distinct LoCoMo greeting turns scored
+                // 0.98) where that destroyed the earlier memory's content.
+                summary: icm_core::merge_summaries(&existing.summary, &memory.summary),
                 raw_excerpt: memory.raw_excerpt.clone().or(existing.raw_excerpt),
-                keywords: if memory.keywords.is_empty() {
-                    existing.keywords
-                } else {
-                    memory.keywords.clone()
-                },
+                keywords: icm_core::union_keywords(&existing.keywords, &memory.keywords),
                 embedding: memory.embedding.clone(),
                 // Never let a near-dup merge downgrade importance — a
                 // `--importance` omission defaults to Medium and would
@@ -2700,7 +2906,7 @@ fn cmd_store(
                 "Updated existing memory (similarity {score:.2}): {}",
                 updated.id
             );
-            maybe_auto_consolidate(store, embedder, &topic, memory_cfg);
+            maybe_auto_consolidate(store, embedder, &topic, memory_cfg, consolidate_cfg);
             return Ok(());
         }
     }
@@ -2737,7 +2943,7 @@ fn cmd_store(
     }
 
     // Auto-consolidate the topic if config says so. Closes audit M2/AC1.
-    maybe_auto_consolidate(store, embedder, &topic, memory_cfg);
+    maybe_auto_consolidate(store, embedder, &topic, memory_cfg, consolidate_cfg);
 
     Ok(())
 }
@@ -2749,6 +2955,7 @@ fn cmd_remember(
     store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
     memory_cfg: &crate::config::MemoryConfig,
+    consolidate_cfg: &crate::config::ConsolidateConfig,
     content: String,
     topic: Option<String>,
     importance: Importance,
@@ -2766,12 +2973,34 @@ fn cmd_remember(
         store,
         embedder,
         memory_cfg,
+        consolidate_cfg,
         resolved_topic,
         content,
         importance,
         keywords,
         None,
     )
+}
+
+/// How many candidates to ask the store for before applying a
+/// project/topic/keyword filter.
+///
+/// `search_hybrid`/`search_fts`/`search_by_keywords` are topic-oblivious —
+/// they rank and truncate to `limit` globally, across every topic in the
+/// database. Passing the caller's `limit` straight through when a filter is
+/// about to run means the filter only ever sees the global top-`limit`
+/// candidates: on a database with several topics, those can all belong to
+/// topics other than the one being filtered for, and recall reports "no
+/// memories" even though relevant matches exist further down the ranking
+/// (same bug the MCP `tool_recall` path already fixed — this mirrors it for
+/// the CLI). Widen the pool whenever a filter is active; leave it alone
+/// otherwise so the unfiltered path doesn't pay for candidates it won't use.
+fn recall_query_limit(limit: usize, filters_active: bool) -> usize {
+    if filters_active {
+        (limit * 10).min(200)
+    } else {
+        limit
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2799,10 +3028,24 @@ fn cmd_recall(
         }
     };
 
+    // Same audit finding the MCP `tool_recall` path already fixed, ported
+    // here: `search_hybrid`/`search_fts`/`search_by_keywords` are
+    // topic-oblivious and truncate to `limit` BEFORE the project/topic/
+    // keyword filter below runs. On a database with several topics (the
+    // normal case — this store alone has ~30), the global top-`limit` hits
+    // can all belong to other topics, so a `-t` filter finds nothing even
+    // though relevant same-topic memories exist further down the ranking.
+    // When any filter is active, request a much larger candidate pool so
+    // filtering has enough to work with; truncate to the caller's `limit`
+    // only at the very end (`expand_with_neighbors`'s `max_total`).
+    let project_active = matches!(project, Some(p) if !p.is_empty());
+    let filters_active = project_active || topic.is_some() || keyword.is_some();
+    let query_limit = recall_query_limit(limit, filters_active);
+
     // Try hybrid search if embedder is available; fall back to FTS / keywords.
     let scored: Option<Vec<(Memory, f32)>> = embedder
         .and_then(|emb| emb.embed_query(query).ok())
-        .and_then(|query_emb| store.search_hybrid(query, &query_emb, limit).ok());
+        .and_then(|query_emb| store.search_hybrid(query, &query_emb, query_limit).ok());
 
     let (mut results, has_score): (Vec<(Memory, Option<f32>)>, bool) = match scored {
         Some(scored) => {
@@ -2810,10 +3053,10 @@ fn cmd_recall(
             (pairs, true)
         }
         None => {
-            let mut fts = store.search_fts(query, limit)?;
+            let mut fts = store.search_fts(query, query_limit)?;
             if fts.is_empty() {
                 let kws: Vec<&str> = query.split_whitespace().collect();
-                fts = store.search_by_keywords(&kws, limit)?;
+                fts = store.search_by_keywords(&kws, query_limit)?;
             }
             (fts.into_iter().map(|m| (m, None)).collect(), false)
         }
@@ -3697,10 +3940,12 @@ fn extract_tool_input_file_path(json: &Value) -> Option<String> {
 /// 2. **Inline path** (default, `provider = "none"`). Current
 ///    fastembed semantic-scoring extractor — multilingual, but pays
 ///    a ~3.7s model-load cost per process.
+#[allow(clippy::too_many_arguments)]
 fn cmd_hook_post(
     store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
     memory_cfg: &crate::config::MemoryConfig,
+    consolidate_cfg: &crate::config::ConsolidateConfig,
     extract_every: usize,
     extraction_cfg: &crate::config::ExtractionConfig,
     archive_cfg: &crate::config::ArchiveConfig,
@@ -3835,7 +4080,7 @@ fn cmd_hook_post(
             // If the user has auto-consolidate enabled, fire it now so the
             // hook path stops bypassing the rollup.
             let topic = format!("context-{project}");
-            maybe_auto_consolidate(store, embedder, &topic, memory_cfg);
+            maybe_auto_consolidate(store, embedder, &topic, memory_cfg, consolidate_cfg);
         }
         _ => {}
     }
@@ -3848,8 +4093,9 @@ fn cmd_hook_compact(
     store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
     memory_cfg: &crate::config::MemoryConfig,
+    consolidate_cfg: &crate::config::ConsolidateConfig,
 ) -> Result<()> {
-    extract_from_hook_transcript(store, embedder, memory_cfg, "pre-compact")
+    extract_from_hook_transcript(store, embedder, memory_cfg, consolidate_cfg, "pre-compact")
 }
 
 // ── Hook telemetry CLI ─────────────────────────────────────────────────
@@ -3936,6 +4182,7 @@ fn cmd_hook_end(
     store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
     memory_cfg: &crate::config::MemoryConfig,
+    consolidate_cfg: &crate::config::ConsolidateConfig,
     extraction_summarizer: &crate::config::SummarizerConfig,
 ) -> Result<()> {
     // Reentrancy guard (#322): if this hook is firing inside an
@@ -3947,6 +4194,37 @@ fn cmd_hook_end(
     // transcript worth extracting anyway.
     if std::env::var_os("ICM_WORKER").is_some() {
         return Ok(());
+    }
+
+    // Issue #179: same detached-worker pattern as the extraction queue
+    // below, but for pending_consolidations. Independent of the
+    // extraction fork — a user can have one provider configured without
+    // the other. `consolidate-pending` is cheap to invoke even when the
+    // queue is empty (prints "No pending consolidations." and exits), so
+    // no need to peek the count first.
+    if consolidate_cfg.summarizer.provider != "none" {
+        spawn_detached_worker(&["consolidate-pending", "--limit", "20"], "consolidation");
+    }
+
+    // Issue #179 follow-up: `icm hook start` / `icm wake-up` prefer a cached
+    // LLM briefing (#165) over the plain bullet pack when one exists — but
+    // until now nothing ever populated that cache automatically. A fresh
+    // install's SessionStart hook would silently keep serving the plain
+    // pack forever unless the user remembered to run `icm briefing`
+    // manually or wired their own cron. Refresh it here, off the critical
+    // path, same as the consolidation fork — rate-limited by
+    // `BRIEFING_REFRESH_INTERVAL` so a chatty session doesn't trigger an
+    // LLM call on every single SessionEnd.
+    if consolidate_cfg.summarizer.provider != "none" {
+        let project = detect_project();
+        let stale = project != "unknown"
+            && !project.is_empty()
+            && briefing_cache_path(&project)
+                .map(|p| briefing_cache_is_stale(&p, BRIEFING_REFRESH_INTERVAL))
+                .unwrap_or(true);
+        if stale {
+            spawn_detached_worker(&["briefing", "--project", project.as_str()], "briefing");
+        }
     }
 
     // Async path: when a provider is configured, drain the
@@ -3994,6 +4272,7 @@ fn cmd_hook_end(
                         store,
                         embedder,
                         memory_cfg,
+                        consolidate_cfg,
                         "session-end",
                     );
                 }
@@ -4002,7 +4281,43 @@ fn cmd_hook_end(
         }
     }
     // Inline path (legacy): scan transcript and extract via fastembed.
-    extract_from_hook_transcript(store, embedder, memory_cfg, "session-end")
+    extract_from_hook_transcript(store, embedder, memory_cfg, consolidate_cfg, "session-end")
+}
+
+/// Fork a detached, `ICM_WORKER`-tagged copy of this binary running
+/// `args`, redirected to `/dev/null` and set to outlive the parent (Unix:
+/// new session via `setsid`). Used by the SessionEnd hook to drain async
+/// queues (extraction, consolidation) off the critical path without
+/// Claude Code killing us with "Hook cancelled". Failure is logged, not
+/// propagated — the caller has its own inline fallback (extraction) or
+/// simply skips this round (consolidation, picked up on the next
+/// SessionEnd or a manual `icm consolidate-pending`).
+fn spawn_detached_worker(args: &[&str], label: &str) {
+    let Ok(self_path) = std::env::current_exe() else {
+        return;
+    };
+    let mut cmd = std::process::Command::new(&self_path);
+    cmd.args(args);
+    // Mark the worker subtree (#322) so any hook fired by an LLM CLI it
+    // spawns short-circuits instead of forking again.
+    cmd.env("ICM_WORKER", "1");
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    match cmd.spawn() {
+        Ok(_) => eprintln!("[icm] session-end: forked async {label} worker"),
+        Err(e) => eprintln!("[icm] session-end: {label} worker fork failed ({e}), skipping"),
+    }
 }
 
 /// Read JSON from stdin, locate the transcript file, parse the last 100
@@ -4015,6 +4330,7 @@ fn extract_from_hook_transcript(
     store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
     memory_cfg: &crate::config::MemoryConfig,
+    consolidate_cfg: &crate::config::ConsolidateConfig,
     source: &str,
 ) -> Result<()> {
     let Some(input) = read_stdin_utf8_lossy() else {
@@ -4155,7 +4471,7 @@ fn extract_from_hook_transcript(
             // so the PreCompact / SessionEnd path stops bypassing the
             // rollup configured in `[memory] auto_consolidate_enabled`.
             let topic = format!("context-{project}");
-            maybe_auto_consolidate(store, embedder, &topic, memory_cfg);
+            maybe_auto_consolidate(store, embedder, &topic, memory_cfg, consolidate_cfg);
         }
         _ => {}
     }
@@ -4818,6 +5134,7 @@ fn cmd_init(
     force: bool,
     per_project: bool,
     with_codex_post_hook: bool,
+    db_path: &Path,
 ) -> Result<()> {
     let icm_bin = std::env::current_exe().context("cannot determine icm binary path")?;
     let icm_bin_str = portable_command_path(&icm_bin);
@@ -5069,6 +5386,27 @@ You MUST call `icm store` when ANY of the following happens:\n\
 Do this BEFORE responding to the user. Not after. Not later. Immediately.\n\
 \n\
 Do NOT store: trivial details, info already in this file, ephemeral state (build logs, git status).\n\
+\n\
+### Memoirs (permanent knowledge graphs)\n\
+Use memoirs for durable, structured knowledge that outlasts individual memories.\n\
+```bash\n\
+icm memoir create -n \"my-memoir\" -d \"Description\"   # create knowledge container\n\
+icm memoir add-concept -m \"my-memoir\" -n \"concept\" \\\n\
+  -d \"Dense definition\" -l \"type:decision,domain:arch\" # add concept with labels\n\
+icm memoir link -m \"my-memoir\" --from \"a\" --to \"b\" \\\n\
+  -r depends-on                                        # link concepts (relations:\n\
+                                                       # part-of, depends-on, related-to,\n\
+                                                       # contradicts, refines,\n\
+                                                       # alternative-to, caused-by,\n\
+                                                       # instance-of, superseded-by)\n\
+icm memoir export -m \"my-memoir\" -f ai                # dump as LLM-ready markdown\n\
+icm memoir search -m \"my-memoir\" \"query\"              # full-text search concepts\n\
+icm memoir list                                        # list all memoirs\n\
+icm memoir show \"my-memoir\"                            # stats + concept list\n\
+icm memoir inspect --memoir \"my-memoir\" \"concept\"      # full definition + graph\n\
+icm memoir refine --memoir \"my-memoir\" --name \"concept\" \\\n\
+  --definition \"new text\"                              # update concept (bumps revision)\n\
+```\n\
 \n\
 ### Other commands\n\
 ```bash\n\
@@ -5690,9 +6028,34 @@ description: ICM persistent memory — /{name}
         manifest.save(&manifest_path)?;
     }
 
+    // --- Project-local .icm/ setup ---
+    // When --per-project is set, create a project-local database config
+    // so ICM uses a separate database per project. This creates:
+    //   <git-root>/.icm/config.toml  with  [store] path = ".icm/memories.db"
+    // On subsequent invocations, the resolver will pick this up.
+    if per_project {
+        let project_root = detect_project_root().or_else(|| std::env::current_dir().ok());
+        if let Some(root) = project_root {
+            let icm_dir = root.join(".icm");
+            if !icm_dir.is_dir() {
+                std::fs::create_dir_all(&icm_dir)
+                    .with_context(|| format!("creating {}", icm_dir.display()))?;
+                let project_cfg = icm_dir.join("config.toml");
+                std::fs::write(&project_cfg, "[store]\npath = \".icm/memories.db\"\n")
+                    .with_context(|| format!("writing {}", project_cfg.display()))?;
+                println!(
+                    "[project] created project-local .icm/ at {}",
+                    root.display()
+                );
+            } else {
+                println!("[project] .icm/ already exists at {}", root.display());
+            }
+        }
+    }
+
     println!();
     println!("  binary:   {icm_bin_str}");
-    println!("  db:       {}", default_db_path().display());
+    println!("  db:       {}", db_path.display());
     if !manifest.is_empty() {
         println!(
             "  manifest: {} ({} entr{})",
@@ -6970,12 +7333,15 @@ pub(crate) fn parse_json_config(config_path: &std::path::Path) -> Result<Value> 
     Ok(strict)
 }
 
-/// Returns true if `name` resolves to an executable file somewhere in $PATH.
+/// Cross-platform PATH-based executable lookup (issue #428). Delegates to
+/// the `which` crate rather than hand-rolling it: a previous version split
+/// `$PATH` on a hardcoded `:` and checked the bare name with no extension —
+/// correct on Unix, but on Windows `PATH` entries are `;`-separated and
+/// every real executable needs a `PATHEXT` suffix (`.exe`, `.cmd`, …), so
+/// this silently found nothing for *every* tool `icm init`/`doctor` detect,
+/// not just the OpenCode Desktop app the issue reported.
 fn binary_in_path(name: &str) -> bool {
-    std::env::var("PATH")
-        .unwrap_or_default()
-        .split(':')
-        .any(|dir| std::path::Path::new(dir).join(name).is_file())
+    which::which(name).is_ok()
 }
 
 /// Heuristic: is this AI tool installed on the current machine?
@@ -7074,6 +7440,28 @@ fn detect_tool(name: &str, home: &str, vscode_data: &Path) -> bool {
         // pnpm-global env quirks). See issue #259.
         "Pi" => binary_in_path("pi") || PathBuf::from(home).join(".pi/agent").exists(),
         _ => true,
+    }
+}
+
+#[cfg(test)]
+mod binary_in_path_tests {
+    use super::*;
+
+    /// Issue #428: `binary_in_path` must find a real, definitely-installed
+    /// binary. `cargo` itself is the safest choice — every CI job (and any
+    /// dev machine running `cargo test`) has it on `$PATH` by construction,
+    /// on every platform this crate ships for (unlike a Unix-only tool like
+    /// `sh`, which isn't a given on `windows-latest`).
+    #[test]
+    fn finds_a_real_binary_that_is_definitely_on_path() {
+        assert!(binary_in_path("cargo"));
+    }
+
+    #[test]
+    fn does_not_find_a_binary_that_does_not_exist() {
+        assert!(!binary_in_path(
+            "icm-test-binary-that-almost-certainly-does-not-exist-anywhere"
+        ));
     }
 }
 
@@ -7454,18 +7842,54 @@ fn inject_opencode_mcp_server(config_path: &Path, name: &str, icm_bin: &str) -> 
     Ok("configured".into())
 }
 
-fn cmd_config() -> Result<()> {
-    let cfg = config::load_config()?;
+fn cmd_config(cli_db: Option<PathBuf>, cfg: &config::Config) -> Result<()> {
     println!("Config: {}", config::show_config_path());
     println!();
     println!("[store]");
+    let env_db = std::env::var("ICM_DB").ok();
+    let project_root = detect_project_root();
+    let resolved = resolve_db_path(cli_db, cfg);
+    println!("  resolved = {}", resolved.display());
     println!(
-        "  path = {}",
-        cfg.store
-            .path
-            .as_deref()
-            .unwrap_or("(default platform path)")
+        "  path (config) = {}",
+        cfg.store.path.as_deref().unwrap_or("(not set)")
     );
+    if let Some(ref env) = env_db {
+        println!("  ICM_DB (env)  = {env}");
+    } else {
+        println!("  ICM_DB (env)  = (not set)");
+    }
+    if let Some(root) = &project_root {
+        println!();
+        println!("[project]");
+        println!("  root = {}", root.display());
+        let icm_dir = root.join(".icm");
+        if icm_dir.is_dir() {
+            println!("  .icm/ exists");
+            let project_cfg = icm_dir.join("config.toml");
+            if project_cfg.exists() {
+                if let Ok(content) = std::fs::read_to_string(&project_cfg) {
+                    if let Ok(value) = content.parse::<toml::Value>() {
+                        if let Some(path_str) = value
+                            .get("store")
+                            .and_then(|s| s.get("path"))
+                            .and_then(|p| p.as_str())
+                        {
+                            println!("  .icm/config.toml [store].path = {path_str}");
+                        }
+                    }
+                }
+            }
+            let project_db = icm_dir.join("memories.db");
+            if project_db.exists() {
+                println!("  .icm/memories.db exists");
+            } else {
+                println!("  .icm/memories.db (not found)");
+            }
+        } else {
+            println!("  .icm/ (not found)");
+        }
+    }
     println!();
     println!("[memory]");
     println!("  default_importance = {}", cfg.memory.default_importance);
@@ -7522,34 +7946,6 @@ fn resolve_consolidate_provider(
     })
 }
 
-/// Check whether `name` resolves to an executable file on `$PATH`.
-///
-/// Used by the extraction drain to decide whether a configured LLM CLI
-/// (claude/codex/gemini/ollama) is actually usable, or whether it should
-/// fall back to the fastembed extractor.
-fn cli_on_path(name: &str) -> bool {
-    let Ok(path) = std::env::var("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| {
-        let candidate = dir.join(name);
-        if !candidate.is_file() {
-            return false;
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::metadata(&candidate)
-                .map(|m| m.permissions().mode() & 0o111 != 0)
-                .unwrap_or(false)
-        }
-        #[cfg(not(unix))]
-        {
-            true
-        }
-    })
-}
-
 /// Best-effort inter-process singleton lock for the extract-pending worker
 /// (#322). Held for the lifetime of the value; the OS releases the advisory
 /// `flock` when the file descriptor closes on drop.
@@ -7562,11 +7958,15 @@ impl WorkerLock {
     /// Try to take the lock next to the DB. `Ok(Some(_))` = acquired,
     /// `Ok(None)` = another process already holds it, `Err` = the lockfile
     /// itself could not be created (caller may proceed without the guard).
-    fn acquire(db_path: &std::path::Path) -> Result<Option<Self>> {
+    ///
+    /// `kind` names the lockfile (e.g. `"extract"`, `"consolidate"`) so
+    /// independent async workers (issue #179) don't contend on the same
+    /// advisory lock and can run concurrently with each other.
+    fn acquire(db_path: &std::path::Path, kind: &str) -> Result<Option<Self>> {
         #[cfg(unix)]
         {
             use std::os::unix::io::AsRawFd;
-            let lock_path = db_path.with_extension("extract.lock");
+            let lock_path = db_path.with_extension(format!("{kind}.lock"));
             let file = std::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
@@ -7591,42 +7991,26 @@ impl WorkerLock {
         }
         #[cfg(not(unix))]
         {
-            let _ = db_path;
+            let _ = (db_path, kind);
             Ok(Some(Self {}))
         }
     }
 }
 
-/// Process the async extraction queue.
-///
-/// Reads up to `limit` oldest pending rows from `pending_extractions`.
-///
-/// With an LLM provider configured, it concatenates their raw outputs,
-/// asks the configured LLM CLI to extract decisions / architecture /
-/// preferences, parses the bullet response, and stores the results as
-/// Memory rows.
-///
-/// With `provider = "none"`, or when the resolved CLI is not installed,
-/// it falls back to the fastembed extractor — but runs it **once** over
-/// the whole drained batch instead of once per hook fire. That is the
-/// deferred half of the issue #239 fix: editor hooks enqueue cheaply,
-/// and the heavy model load happens here, once per drain.
-///
-/// Successfully-processed rows are deleted from the queue regardless of
-/// whether facts were extracted (so an output with no extractable
-/// content doesn't loop forever).
 /// Drain `pending` through the local fastembed extractor — no network or
 /// LLM CLI needed, so this is the fallback used both when no LLM provider
 /// is configured/available and when a configured one fails at runtime.
+/// Accepts owned rows or borrowed rows (`&[PendingRow]` or `&[&PendingRow]`).
 /// Returns `(facts_stored, rows_dequeued)`.
 fn extract_pending_drain_fastembed(
     store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
-    pending: &[icm_store::PendingRow],
+    pending: &[impl std::borrow::Borrow<icm_store::PendingRow>],
 ) -> Result<(usize, usize)> {
-    let ids: Vec<String> = pending.iter().map(|(id, ..)| id.clone()).collect();
+    let ids: Vec<String> = pending.iter().map(|row| row.borrow().0.clone()).collect();
     let mut stored = 0usize;
-    for (_, project, _, raw, _) in pending {
+    for row in pending {
+        let (_, project, _, raw, _) = row.borrow();
         match extract::extract_and_store_with_embedder(
             store,
             raw,
@@ -7643,6 +8027,216 @@ fn extract_pending_drain_fastembed(
     Ok((stored, deleted))
 }
 
+/// Partition queued rows by project, keeping first-appearance order across
+/// groups and the input order within each group (the store hands rows over
+/// `captured_at ASC`). One LLM prompt per group lets every extracted fact
+/// carry the project whose tool output produced it.
+fn group_pending_by_project(
+    pending: &[icm_store::PendingRow],
+) -> Vec<(String, Vec<&icm_store::PendingRow>)> {
+    let mut groups: Vec<(String, Vec<&icm_store::PendingRow>)> = Vec::new();
+    for row in pending {
+        match groups.iter_mut().find(|(project, _)| *project == row.1) {
+            Some((_, rows)) => rows.push(row),
+            None => groups.push((row.1.clone(), vec![row])),
+        }
+    }
+    groups
+}
+
+/// Build the fact-extraction prompt for one project's queued rows.
+fn build_extract_prompt(rows: &[&icm_store::PendingRow]) -> String {
+    let mut joined = String::new();
+    for (_, project, tool_name, raw, _) in rows.iter().copied() {
+        joined.push_str(&format!("=== tool={tool_name} project={project} ===\n"));
+        joined.push_str(raw);
+        joined.push_str("\n\n");
+    }
+    format!(
+        "From the tool outputs below, extract durable facts that an AI agent \
+         should remember across sessions: architecture decisions, resolved \
+         errors, user preferences, project-specific context.\n\
+         \n\
+         Output format: one fact per line, prefixed with `- `. Each fact \
+         must be a complete, standalone sentence — no pronouns referring to \
+         missing context. Skip routine noise (file listings, build progress, \
+         git status). If nothing durable is present, output exactly `- (none)`.\n\
+         \n\
+         {joined}",
+    )
+}
+
+/// Counters for one `extract-pending` drain. They live outside the group loop
+/// so an error that propagates mid-drain can still report what was committed
+/// before it.
+#[derive(Default)]
+struct DrainTally {
+    /// Facts stored, LLM-extracted and fastembed-extracted alike.
+    stored: usize,
+    /// Queue rows deleted.
+    deleted: usize,
+    /// Rows drained through the local extractor after the provider failed.
+    fallback_rows: usize,
+    /// Rows dropped because the provider returned nothing for their group.
+    discarded_rows: usize,
+}
+
+impl DrainTally {
+    /// The one-line run summary. The `fastembed fallback` phrase is a contract:
+    /// operators grep for it to detect a degraded drain.
+    fn summary_line(&self, processed: usize) -> String {
+        let mut notes: Vec<String> = Vec::new();
+        if self.fallback_rows > 0 {
+            notes.push(format!("{} via fastembed fallback", self.fallback_rows));
+        }
+        if self.discarded_rows > 0 {
+            notes.push(format!(
+                "{} dropped after empty provider output",
+                self.discarded_rows
+            ));
+        }
+        let notes = if notes.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", notes.join(", "))
+        };
+        format!(
+            "Processed {processed} rows{notes}, extracted {} facts, dequeued {}.",
+            self.stored, self.deleted
+        )
+    }
+}
+
+/// Drain the project groups: one provider call per group while the provider
+/// works, the local extractor for the failing group and every group after it.
+/// `tally` is updated as each group commits, so the caller can report the
+/// committed prefix even when an error propagates out of the loop.
+#[allow(clippy::too_many_arguments)]
+fn drain_pending_groups(
+    store: &Store,
+    embedder: Option<&dyn icm_core::Embedder>,
+    provider: &dyn summarizer::Summarizer,
+    model: Option<&str>,
+    max_tokens: usize,
+    timeout: std::time::Duration,
+    groups: &[(String, Vec<&icm_store::PendingRow>)],
+    tally: &mut DrainTally,
+) -> Result<()> {
+    // After one runtime failure (auth expired, network down, rate-limited),
+    // assume the CLI keeps failing rather than pay one timeout per remaining
+    // group; those groups take the local extractor instead.
+    let mut provider_failed = false;
+
+    for (project, rows) in groups {
+        let ids: Vec<String> = rows.iter().map(|row| row.0.clone()).collect();
+
+        if provider_failed {
+            let (stored, deleted) = extract_pending_drain_fastembed(store, embedder, rows)?;
+            eprintln!(
+                "[extract-pending] project={project}: {} rows took the fastembed fallback \
+                 (provider unavailable this run)",
+                rows.len()
+            );
+            tally.stored += stored;
+            tally.deleted += deleted;
+            tally.fallback_rows += rows.len();
+            continue;
+        }
+
+        let prompt = build_extract_prompt(rows);
+        let req = summarizer::SummarizeRequest {
+            prompt: &prompt,
+            model,
+            max_tokens,
+            timeout,
+        };
+        let response = match provider.summarize(&req) {
+            Ok(s) if !s.trim().is_empty() => s,
+            Ok(_) => {
+                // Nothing here can tell an input with nothing to extract from a
+                // provider that returned nothing. Either way the rows must not
+                // be retried on every run, so they are dropped and counted.
+                eprintln!(
+                    "[extract-pending] project={project}: provider returned empty output; \
+                     dropping {} rows",
+                    rows.len()
+                );
+                tally.deleted += store.delete_pending_extractions(&ids)?;
+                tally.discarded_rows += rows.len();
+                continue;
+            }
+            Err(e) => {
+                // A CLI missing from PATH already downgrades to fastembed before
+                // this loop (see the `binary_in_path` check) — this handles the
+                // sibling failure mode: the CLI is present but errors at
+                // runtime. Left as a hard error, the queue would never empty,
+                // because every future run would hit the same failing CLI.
+                // Fall back to the local extractor for this group and all
+                // remaining ones; groups already processed above keep their
+                // LLM-extracted facts.
+                eprintln!(
+                    "[extract-pending] project={project}: provider failed: {e} — \
+                     fastembed fallback for this group and the remaining groups"
+                );
+                provider_failed = true;
+                let (stored, deleted) = extract_pending_drain_fastembed(store, embedder, rows)?;
+                tally.stored += stored;
+                tally.deleted += deleted;
+                tally.fallback_rows += rows.len();
+                continue;
+            }
+        };
+
+        // Parse bullet output into individual facts, each filed under the
+        // project whose rows produced it.
+        let topic = format!("context-{project}");
+        for line in response.lines() {
+            let line = line.trim();
+            let fact = line
+                .strip_prefix("- ")
+                .or_else(|| line.strip_prefix("* "))
+                .unwrap_or(line)
+                .trim();
+            if fact.is_empty() || fact == "(none)" || fact.eq_ignore_ascii_case("none") {
+                continue;
+            }
+            let mut mem = Memory::new(topic.clone(), fact.to_string(), Importance::Medium);
+            // Same bug class as #394: this LLM-backed extraction path is a
+            // sibling of extract_and_store_with_embedder and had the same gap
+            // — the embedder was available but never attached to the Memory.
+            if let Some(emb) = embedder {
+                if let Ok(vec) = emb.embed(&mem.embed_text()) {
+                    mem.embedding = Some(vec);
+                }
+            }
+            store.store(mem)?;
+            tally.stored += 1;
+        }
+        tally.deleted += store.delete_pending_extractions(&ids)?;
+    }
+    Ok(())
+}
+
+/// Process the async extraction queue.
+///
+/// Reads up to `limit` oldest pending rows from `pending_extractions` and
+/// groups them by project.
+///
+/// With an LLM provider configured, it asks the configured LLM CLI once per
+/// project to extract decisions / architecture / preferences from that
+/// project's raw outputs, parses the bullet response, and stores each fact
+/// under `context-<project>`.
+///
+/// With `provider = "none"`, or when the resolved CLI is not installed, it
+/// runs the fastembed extractor over the drained rows instead — once per
+/// drain rather than once per hook fire (the deferred half of the issue #239
+/// fix: editor hooks enqueue cheaply, and the heavy model load happens here).
+/// A CLI that fails at runtime triggers the same fallback for the failing
+/// group and every group after it.
+///
+/// Successfully-processed rows are deleted from the queue regardless of
+/// whether facts were extracted (so an output with no extractable
+/// content doesn't loop forever).
 #[allow(clippy::too_many_arguments)]
 fn cmd_extract_pending(
     store: &Store,
@@ -7663,7 +8257,7 @@ fn cmd_extract_pending(
     let _lock = if dry_run {
         None
     } else {
-        match WorkerLock::acquire(db_path) {
+        match WorkerLock::acquire(db_path, "extract") {
             Ok(Some(l)) => Some(l),
             Ok(None) => {
                 println!("Another extract-pending worker is already running; skipping.");
@@ -7691,7 +8285,7 @@ fn cmd_extract_pending(
     // never empty — so downgrade to the batched fastembed path when the
     // binary is missing.
     if !matches!(provider_kind, summarizer::ProviderKind::None)
-        && !cli_on_path(provider_kind.as_str())
+        && !binary_in_path(provider_kind.as_str())
     {
         eprintln!(
             "[extract-pending] '{}' CLI not found on PATH — draining with \
@@ -7720,19 +8314,10 @@ fn cmd_extract_pending(
         return Ok(());
     }
 
-    // Build a single LLM prompt covering all rows. The prompt asks for
-    // a structured bullet list so we can deterministically split into
-    // facts. Each bullet becomes one Memory.
-    let mut joined = String::new();
-    let mut ids: Vec<String> = Vec::new();
-    let mut project_for_each: Vec<String> = Vec::new();
-    for (id, project, tool_name, raw, _ts) in &pending {
-        joined.push_str(&format!("=== tool={tool_name} project={project} ===\n"));
-        joined.push_str(raw);
-        joined.push_str("\n\n");
-        ids.push(id.clone());
-        project_for_each.push(project.clone());
-    }
+    // One prompt per project. Queue rows from concurrent sessions interleave,
+    // so a drained batch usually spans several projects, and a single prompt
+    // for the whole batch could only file every fact under one of them.
+    let groups = group_pending_by_project(&pending);
 
     let model_owned: Option<String> = cli_model.map(|s| s.to_string()).or_else(|| {
         if cfg.model.is_empty() {
@@ -7743,19 +8328,6 @@ fn cmd_extract_pending(
     });
     let max_tokens = cfg.max_tokens;
 
-    let prompt = format!(
-        "From the tool outputs below, extract durable facts that an AI agent \
-         should remember across sessions: architecture decisions, resolved \
-         errors, user preferences, project-specific context.\n\
-         \n\
-         Output format: one fact per line, prefixed with `- `. Each fact \
-         must be a complete, standalone sentence — no pronouns referring to \
-         missing context. Skip routine noise (file listings, build progress, \
-         git status). If nothing durable is present, output exactly `- (none)`.\n\
-         \n\
-         {joined}",
-    );
-
     if dry_run {
         println!("=== Dry run ===");
         println!("provider: {provider_kind:?}");
@@ -7764,92 +8336,39 @@ fn cmd_extract_pending(
             model_owned.as_deref().unwrap_or("<provider default>")
         );
         println!("rows: {}", pending.len());
-        println!("--- prompt ---");
-        println!("{prompt}");
+        println!("projects: {}", groups.len());
+        for (project, rows) in &groups {
+            println!("--- prompt (project={project}, rows={}) ---", rows.len());
+            println!("{}", build_extract_prompt(rows));
+        }
         return Ok(());
     }
 
     let provider = summarizer::make_summarizer(provider_kind)?;
-    let req = summarizer::SummarizeRequest {
-        prompt: &prompt,
-        model: model_owned.as_deref(),
+    let timeout = std::time::Duration::from_secs(cfg.timeout_secs);
+    let mut tally = DrainTally::default();
+    if let Err(e) = drain_pending_groups(
+        store,
+        embedder,
+        provider.as_ref(),
+        model_owned.as_deref(),
         max_tokens,
-        timeout: std::time::Duration::from_secs(cfg.timeout_secs),
-    };
-    let response = match provider.summarize(&req) {
-        Ok(s) if !s.trim().is_empty() => s,
-        Ok(_) => {
-            eprintln!("[extract-pending] provider returned empty output");
-            // Still drop the rows so we don't loop forever on bad inputs.
-            store.delete_pending_extractions(&ids)?;
-            return Ok(());
-        }
-        Err(e) => {
-            // A CLI missing from PATH already downgrades to fastembed above
-            // (see the `cli_on_path` check) — this handles the sibling
-            // failure mode: the CLI is present but errors at runtime (auth
-            // expired, network down, rate-limited). Left as a hard error,
-            // that's the exact "queue never empties" scenario the PATH
-            // check was built to avoid, just triggered a different way:
-            // every future extract-pending run keeps hitting the same
-            // failing CLI and the queue grows forever. Fall back to the
-            // local extractor for this batch instead.
-            eprintln!(
-                "[extract-pending] provider failed: {e} — falling back to \
-                 the fastembed extractor for this batch"
-            );
-            let (stored, deleted) = extract_pending_drain_fastembed(store, embedder, &pending)?;
-            println!(
-                "Processed {} rows (fastembed fallback), extracted {} facts, dequeued {}.",
-                pending.len(),
-                stored,
-                deleted,
-            );
-            return Ok(());
-        }
-    };
-
-    // Parse bullet output into individual facts.
-    let mut stored = 0usize;
-    for line in response.lines() {
-        let line = line.trim();
-        let fact = line
-            .strip_prefix("- ")
-            .or_else(|| line.strip_prefix("* "))
-            .unwrap_or(line)
-            .trim();
-        if fact.is_empty() || fact == "(none)" || fact.eq_ignore_ascii_case("none") {
-            continue;
-        }
-        // Use the first row's project as the topic anchor — most batches
-        // will be from a single session anyway. Multi-project batches
-        // get a slightly weaker per-fact attribution; not worth more
-        // ceremony in v1.
-        let project = project_for_each
-            .first()
-            .map(|s| s.as_str())
-            .unwrap_or("project");
-        let topic = format!("context-{project}");
-        let mut mem = Memory::new(topic, fact.to_string(), Importance::Medium);
-        // Same bug class as #394: this LLM-backed extraction path is a
-        // sibling of extract_and_store_with_embedder and had the same gap
-        // — the embedder was available but never attached to the Memory.
-        if let Some(emb) = embedder {
-            if let Ok(vec) = emb.embed(&mem.embed_text()) {
-                mem.embedding = Some(vec);
-            }
-        }
-        store.store(mem)?;
-        stored += 1;
+        timeout,
+        &groups,
+        &mut tally,
+    ) {
+        // Groups drained before the error are committed (facts stored, rows
+        // deleted); say so, or a retry wrapper cannot tell zero from several.
+        eprintln!(
+            "[extract-pending] aborted after dequeuing {} of {} rows ({} facts stored): {e}",
+            tally.deleted,
+            pending.len(),
+            tally.stored
+        );
+        return Err(e);
     }
 
-    let deleted = store.delete_pending_extractions(&ids)?;
-    println!(
-        "Processed {} rows, extracted {} facts, dequeued {}.",
-        pending.len(),
-        stored,
-        deleted,
-    );
+    println!("{}", tally.summary_line(pending.len()));
     Ok(())
 }
 
@@ -8107,6 +8626,147 @@ fn cmd_consolidate_all(
     Ok(())
 }
 
+/// `icm consolidate-pending` — drain the async consolidation queue (issue
+/// #179). Unlike `consolidate-all`'s cron-style topic scan, this only
+/// processes topics explicitly enqueued by [`maybe_auto_consolidate`] (the
+/// synchronous auto-consolidate trigger, once an LLM summarizer is
+/// configured — the whole point being to move that ~10-15s LLM call off the
+/// hot `icm store` path). Reuses [`cmd_consolidate`] per job, same as
+/// `consolidate-all` reuses it per topic; never keeps originals, for the
+/// same idempotency reason (a just-consolidated topic collapses under the
+/// threshold and won't be re-enqueued).
+#[allow(clippy::too_many_arguments)]
+fn cmd_consolidate_pending(
+    store: &Store,
+    embedder: Option<&dyn icm_core::Embedder>,
+    cfg: &config::SummarizerConfig,
+    limit: usize,
+    cli_provider: Option<&str>,
+    cli_model: Option<&str>,
+    dry_run: bool,
+    db_path: &std::path::Path,
+) -> Result<()> {
+    // Separate lockfile from the extraction worker (see WorkerLock::acquire)
+    // so the two async queues can drain concurrently — they touch disjoint
+    // tables and neither holds a long-running transaction across rows.
+    let _lock = if dry_run {
+        None
+    } else {
+        match WorkerLock::acquire(db_path, "consolidate") {
+            Ok(Some(l)) => Some(l),
+            Ok(None) => {
+                println!("Another consolidate-pending worker is already running; skipping.");
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!(
+                    "[consolidate-pending] lock unavailable ({e}); proceeding without singleton guard"
+                );
+                None
+            }
+        }
+    };
+
+    let jobs = store.list_pending_consolidation_jobs(limit)?;
+    if jobs.is_empty() {
+        println!("No pending consolidations.");
+        return Ok(());
+    }
+
+    if dry_run {
+        println!("=== Dry run ===");
+        println!("jobs: {}", jobs.len());
+        for job in &jobs {
+            println!("  {} — topic '{}'", job.id, job.topic);
+        }
+        return Ok(());
+    }
+
+    let mut done = 0usize;
+    let mut failed = 0usize;
+    for job in &jobs {
+        println!("[consolidate-pending] {} (topic '{}')…", job.id, job.topic);
+        match cmd_consolidate(
+            store,
+            &job.topic,
+            false,
+            cfg,
+            cli_provider,
+            cli_model,
+            None,
+            embedder,
+        ) {
+            Ok(()) => {
+                if let Err(e) = store.mark_consolidation_job_done(&job.id) {
+                    tracing::warn!("mark_consolidation_job_done failed for {}: {e}", job.id);
+                }
+                done += 1;
+            }
+            Err(e) => {
+                eprintln!(
+                    "[consolidate-pending] job {} (topic '{}') failed: {e}",
+                    job.id, job.topic
+                );
+                if let Err(e2) = store.mark_consolidation_job_failed(&job.id, &e.to_string()) {
+                    tracing::warn!("mark_consolidation_job_failed failed for {}: {e2}", job.id);
+                }
+                failed += 1;
+            }
+        }
+    }
+
+    println!();
+    if failed == 0 {
+        println!("Processed {done} job(s).");
+    } else {
+        println!("Processed {done} job(s); {failed} failed (see errors above, retry with `icm consolidate-jobs --retry <id>`).");
+    }
+    Ok(())
+}
+
+/// `icm consolidate-jobs` — list async consolidation jobs (issue #179), or
+/// with `--retry <id>`, reset one `failed` job back to `pending` so the next
+/// `consolidate-pending` drain picks it up again.
+fn cmd_consolidate_jobs(
+    store: &Store,
+    status: Option<&str>,
+    limit: usize,
+    retry: Option<&str>,
+) -> Result<()> {
+    if let Some(id) = retry {
+        return if store.retry_consolidation_job(id)? {
+            println!("Job {id} reset to pending.");
+            Ok(())
+        } else {
+            bail!("job {id} not found or not in 'failed' status — nothing to retry");
+        };
+    }
+
+    let jobs = store.list_consolidation_jobs(status, limit)?;
+    if jobs.is_empty() {
+        println!("No consolidation jobs.");
+        return Ok(());
+    }
+    for job in &jobs {
+        let completed = job
+            .completed_at
+            .map(|d| d.to_rfc3339())
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "{}  {:<8}  {:<30}  created={}  completed={}",
+            job.id,
+            job.status,
+            job.topic,
+            job.created_at.to_rfc3339(),
+            completed
+        );
+        if let Some(err) = &job.error {
+            println!("    error: {err}");
+        }
+    }
+    Ok(())
+}
+
 fn cmd_extract(
     store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
@@ -8280,6 +8940,22 @@ fn load_cached_briefing_at(path: &std::path::Path) -> Option<String> {
 /// the static bullet pack when the user has generated one.
 fn load_cached_briefing(project: Option<&str>) -> Option<String> {
     load_cached_briefing_at(&briefing_cache_path(project?)?)
+}
+
+/// Minimum age before SessionEnd bothers regenerating the cached briefing
+/// (issue #179 follow-up) — keeps a chatty session from firing an LLM call
+/// on every single SessionEnd.
+const BRIEFING_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
+/// True if `path` is missing, unreadable, or older than `max_age` (pure,
+/// testable core of the SessionEnd auto-briefing-refresh trigger, issue #179
+/// follow-up). A cache that's never existed is treated as stale so the very
+/// first refresh actually fires.
+fn briefing_cache_is_stale(path: &std::path::Path, max_age: std::time::Duration) -> bool {
+    match std::fs::metadata(path).and_then(|m| m.modified()) {
+        Ok(modified) => modified.elapsed().map(|age| age > max_age).unwrap_or(true),
+        Err(_) => true,
+    }
 }
 
 /// Build the LLM prompt that compiles a project's memories into a structured
@@ -8537,6 +9213,7 @@ fn cmd_save_project(
     store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
     memory_cfg: &crate::config::MemoryConfig,
+    consolidate_cfg: &crate::config::ConsolidateConfig,
     content: &str,
     importance: Importance,
     keywords: Option<String>,
@@ -8550,6 +9227,7 @@ fn cmd_save_project(
         store,
         embedder,
         memory_cfg,
+        consolidate_cfg,
         topic,
         content.to_string(),
         importance,
@@ -10691,6 +11369,27 @@ mod hook_start_tests {
     }
 
     #[test]
+    fn briefing_cache_is_stale_missing_fresh_and_old() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.md");
+
+        // Never existed → stale, so the very first refresh actually fires.
+        assert!(briefing_cache_is_stale(
+            &path,
+            std::time::Duration::from_secs(3600)
+        ));
+
+        std::fs::write(&path, "briefing").unwrap();
+        // Just written → not stale under a generous max_age.
+        assert!(!briefing_cache_is_stale(
+            &path,
+            std::time::Duration::from_secs(3600)
+        ));
+        // ... but stale under a max_age of zero (anything is "older").
+        assert!(briefing_cache_is_stale(&path, std::time::Duration::ZERO));
+    }
+
+    #[test]
     fn build_briefing_prompt_has_sections_and_memories() {
         use icm_core::{Importance, Memory};
         let mems = vec![
@@ -10889,11 +11588,11 @@ mod hook_start_tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("memories.db");
 
-        let first = WorkerLock::acquire(&db).unwrap();
+        let first = WorkerLock::acquire(&db, "extract").unwrap();
         assert!(first.is_some(), "first acquire should succeed");
 
         // Held: a concurrent acquire is refused (Ok(None)), not an error.
-        let second = WorkerLock::acquire(&db).unwrap();
+        let second = WorkerLock::acquire(&db, "extract").unwrap();
         assert!(
             second.is_none(),
             "second acquire must be refused while held"
@@ -10901,7 +11600,7 @@ mod hook_start_tests {
 
         // Release, then the lock is available again.
         drop(first);
-        let third = WorkerLock::acquire(&db).unwrap();
+        let third = WorkerLock::acquire(&db, "extract").unwrap();
         assert!(third.is_some(), "acquire should succeed after release");
     }
 
@@ -11400,6 +12099,163 @@ mod read_only_requested_tests {
     fn no_flag_no_env_means_writable() {
         with_env(None, || {
             assert!(!read_only_requested(false));
+        });
+    }
+}
+
+#[cfg(test)]
+mod resolve_db_path_tests {
+    use super::*;
+
+    /// `resolve_db_path` reads `$ICM_DB` and shells out to `git rev-parse`
+    /// against the process cwd — both process-global state — so every test
+    /// here holds this lock and restores cwd/env before releasing it.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_isolated_cwd<F: FnOnce(&std::path::Path)>(body: F) {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev_cwd = std::env::current_dir().unwrap();
+        let prev_icm_db = std::env::var("ICM_DB").ok();
+        std::env::remove_var("ICM_DB");
+
+        let dir = tempfile::tempdir().unwrap();
+        // macOS: /tmp (and TMPDIR) is a symlink into /private/tmp — the
+        // `git rev-parse --show-toplevel` that `detect_project_root` shells
+        // out to always returns the canonicalized path, so comparing
+        // against the raw tempdir path here would spuriously fail on a
+        // string mismatch (`/var/folders/...` vs `/private/var/folders/...`)
+        // that has nothing to do with `resolve_db_path`'s actual behavior.
+        let canonical = dir.path().canonicalize().unwrap();
+        std::env::set_current_dir(&canonical).unwrap();
+        body(&canonical);
+
+        std::env::set_current_dir(prev_cwd).unwrap();
+        match prev_icm_db {
+            Some(v) => std::env::set_var("ICM_DB", v),
+            None => std::env::remove_var("ICM_DB"),
+        }
+    }
+
+    #[test]
+    fn cli_flag_wins_over_everything() {
+        with_isolated_cwd(|_| {
+            std::env::set_var("ICM_DB", "/should/not/win");
+            let cfg = config::Config::default();
+            let resolved = resolve_db_path(Some(PathBuf::from("/explicit/flag.db")), &cfg);
+            assert_eq!(resolved, PathBuf::from("/explicit/flag.db"));
+        });
+    }
+
+    #[test]
+    fn env_var_wins_when_no_flag() {
+        with_isolated_cwd(|_| {
+            std::env::set_var("ICM_DB", "/from/env.db");
+            let cfg = config::Config::default();
+            let resolved = resolve_db_path(None, &cfg);
+            assert_eq!(resolved, PathBuf::from("/from/env.db"));
+        });
+    }
+
+    #[test]
+    fn config_path_wins_over_project_local_and_default() {
+        with_isolated_cwd(|dir| {
+            // Even inside a git repo with a project-local .icm/memories.db,
+            // an explicit config [store].path must win (level 3 > 4/5).
+            std::process::Command::new("git")
+                .arg("init")
+                .arg("-q")
+                .current_dir(dir)
+                .status()
+                .unwrap();
+            std::fs::create_dir_all(dir.join(".icm")).unwrap();
+            std::fs::write(dir.join(".icm").join("memories.db"), "").unwrap();
+
+            let mut cfg = config::Config::default();
+            cfg.store.path = Some("/from/config.db".to_string());
+            let resolved = resolve_db_path(None, &cfg);
+            assert_eq!(resolved, PathBuf::from("/from/config.db"));
+        });
+    }
+
+    #[test]
+    fn project_local_config_toml_wins_over_bare_memories_db() {
+        with_isolated_cwd(|dir| {
+            std::process::Command::new("git")
+                .arg("init")
+                .arg("-q")
+                .current_dir(dir)
+                .status()
+                .unwrap();
+            let icm_dir = dir.join(".icm");
+            std::fs::create_dir_all(&icm_dir).unwrap();
+            // Both a config.toml (level 4) and a bare memories.db (level 5)
+            // exist — the config.toml's path must win.
+            std::fs::write(icm_dir.join("memories.db"), "").unwrap();
+            std::fs::write(
+                icm_dir.join("config.toml"),
+                "[store]\npath = \"custom-name.db\"\n",
+            )
+            .unwrap();
+
+            let cfg = config::Config::default();
+            let resolved = resolve_db_path(None, &cfg);
+            // Compare against `detect_project_root()`'s own output rather
+            // than the raw tempdir path: `git rev-parse --show-toplevel`
+            // canonicalizes (symlink resolution on macOS — /var vs
+            // /private/var — and a `\\?\`-prefixed extended path on
+            // Windows), so building the expectation from the same function
+            // under test avoids a platform-specific string mismatch that
+            // has nothing to do with `resolve_db_path`'s actual behavior.
+            let project_root = detect_project_root().unwrap();
+            assert_eq!(resolved, project_root.join("custom-name.db"));
+        });
+    }
+
+    #[test]
+    fn project_local_memories_db_used_when_no_config_toml() {
+        with_isolated_cwd(|dir| {
+            std::process::Command::new("git")
+                .arg("init")
+                .arg("-q")
+                .current_dir(dir)
+                .status()
+                .unwrap();
+            let icm_dir = dir.join(".icm");
+            std::fs::create_dir_all(&icm_dir).unwrap();
+            std::fs::write(icm_dir.join("memories.db"), "").unwrap();
+
+            let cfg = config::Config::default();
+            let resolved = resolve_db_path(None, &cfg);
+            let project_root = detect_project_root().unwrap();
+            assert_eq!(resolved, project_root.join(".icm").join("memories.db"));
+        });
+    }
+
+    #[test]
+    fn falls_back_to_default_outside_any_git_repo_without_icm_dir() {
+        with_isolated_cwd(|_| {
+            // No git init here — not a repo, no .icm/ — must fall through
+            // to the platform default rather than panicking or picking up
+            // an unrelated ancestor repo's .icm/ (e.g. this very checkout's).
+            let cfg = config::Config::default();
+            let resolved = resolve_db_path(None, &cfg);
+            assert_eq!(resolved, default_db_path());
+        });
+    }
+
+    #[test]
+    fn git_repo_without_icm_dir_falls_back_to_default() {
+        with_isolated_cwd(|dir| {
+            std::process::Command::new("git")
+                .arg("init")
+                .arg("-q")
+                .current_dir(dir)
+                .status()
+                .unwrap();
+            // A real git repo, but no .icm/ directory created yet.
+            let cfg = config::Config::default();
+            let resolved = resolve_db_path(None, &cfg);
+            assert_eq!(resolved, default_db_path());
         });
     }
 }
@@ -12009,6 +12865,258 @@ mod cli_contracts_tests {
         }
     }
 
+    #[test]
+    fn group_pending_by_project_keeps_first_appearance_and_row_order() {
+        let row = |id: &str, project: &str| -> icm_store::PendingRow {
+            (
+                id.to_string(),
+                project.to_string(),
+                "Bash".to_string(),
+                format!("output {id}"),
+                format!("2026-01-01T00:00:0{id}Z"),
+            )
+        };
+        let pending = vec![
+            row("1", "a"),
+            row("2", "b"),
+            row("3", "a"),
+            row("4", "c"),
+            row("5", "b"),
+        ];
+
+        let groups = group_pending_by_project(&pending);
+        let shape: Vec<(String, Vec<String>)> = groups
+            .iter()
+            .map(|(project, rows)| {
+                (
+                    project.clone(),
+                    rows.iter().map(|row| row.0.clone()).collect(),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            shape,
+            vec![
+                ("a".to_string(), vec!["1".to_string(), "3".to_string()]),
+                ("b".to_string(), vec!["2".to_string(), "5".to_string()]),
+                ("c".to_string(), vec!["4".to_string()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_extract_prompt_carries_only_the_groups_rows() {
+        let pending: Vec<icm_store::PendingRow> = vec![
+            (
+                "1".into(),
+                "a".into(),
+                "Bash".into(),
+                "alpha output".into(),
+                "t1".into(),
+            ),
+            (
+                "2".into(),
+                "b".into(),
+                "Edit".into(),
+                "beta output".into(),
+                "t2".into(),
+            ),
+        ];
+        let groups = group_pending_by_project(&pending);
+
+        let prompt_a = build_extract_prompt(&groups[0].1);
+        assert!(prompt_a.contains("=== tool=Bash project=a ==="));
+        assert!(prompt_a.contains("alpha output"));
+        assert!(
+            !prompt_a.contains("beta output"),
+            "a project's prompt must not carry another project's rows"
+        );
+
+        let prompt_b = build_extract_prompt(&groups[1].1);
+        assert!(prompt_b.contains("=== tool=Edit project=b ==="));
+        assert!(!prompt_b.contains("alpha output"));
+    }
+
+    #[test]
+    fn extract_pending_drain_fastembed_accepts_borrowed_rows() {
+        use icm_core::{Embedder, IcmResult};
+        struct StubEmbedder;
+        impl Embedder for StubEmbedder {
+            fn embed(&self, text: &str) -> IcmResult<Vec<f32>> {
+                let hit = text.to_lowercase().contains("decided");
+                let mut v = vec![0.0_f32; 64];
+                v[0] = if hit { 1.0 } else { 0.0 };
+                v[1] = if hit { 0.0 } else { 1.0 };
+                Ok(v)
+            }
+            fn embed_batch(&self, texts: &[&str]) -> IcmResult<Vec<Vec<f32>>> {
+                texts.iter().map(|t| self.embed(t)).collect()
+            }
+            fn dimensions(&self) -> usize {
+                64
+            }
+        }
+
+        let store = Store::in_memory_with_dims(64).unwrap();
+        store
+            .enqueue_pending_extraction(
+                "t",
+                "Bash",
+                "We decided to switch from REST to gRPC for internal service calls \
+                 because of latency requirements.",
+            )
+            .unwrap();
+        let pending = store.list_pending_extractions(10).unwrap();
+        let borrowed: Vec<&icm_store::PendingRow> = pending.iter().collect();
+
+        let (stored, deleted) =
+            extract_pending_drain_fastembed(&store, Some(&StubEmbedder), &borrowed).unwrap();
+        assert!(stored > 0, "borrowed rows must extract like owned rows");
+        assert_eq!(deleted, 1);
+        assert!(store.list_pending_extractions(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn drain_pending_groups_files_facts_per_project_and_counts_degraded_groups() {
+        use icm_core::{Embedder, IcmResult};
+        use std::cell::Cell;
+
+        struct StubEmbedder;
+        impl Embedder for StubEmbedder {
+            fn embed(&self, text: &str) -> IcmResult<Vec<f32>> {
+                let hit = text.to_lowercase().contains("decided");
+                let mut v = vec![0.0_f32; 64];
+                v[0] = if hit { 1.0 } else { 0.0 };
+                v[1] = if hit { 0.0 } else { 1.0 };
+                Ok(v)
+            }
+            fn embed_batch(&self, texts: &[&str]) -> IcmResult<Vec<Vec<f32>>> {
+                texts.iter().map(|t| self.embed(t)).collect()
+            }
+            fn dimensions(&self) -> usize {
+                64
+            }
+        }
+
+        /// alpha: two bullets, one of them `(none)`. beta: whitespace only.
+        /// gamma and everything after: runtime failure.
+        struct ScriptedProvider {
+            calls: Cell<usize>,
+        }
+        impl summarizer::Summarizer for ScriptedProvider {
+            fn name(&self) -> &'static str {
+                "scripted"
+            }
+            fn summarize(&self, req: &summarizer::SummarizeRequest<'_>) -> Result<String> {
+                self.calls.set(self.calls.get() + 1);
+                if req.prompt.contains("project=alpha") {
+                    Ok("- alpha stores its ledger in PostgreSQL.\n- (none)\n".to_string())
+                } else if req.prompt.contains("project=beta") {
+                    Ok("   \n".to_string())
+                } else {
+                    Err(anyhow::anyhow!("provider down"))
+                }
+            }
+        }
+
+        let store = Store::in_memory_with_dims(64).unwrap();
+        let rows = [
+            ("alpha", "alpha tool output"),
+            ("beta", "beta tool output"),
+            (
+                "gamma",
+                "We decided to switch from REST to gRPC for gamma because of latency requirements.",
+            ),
+            (
+                "delta",
+                "We decided to shard delta by tenant because of write contention.",
+            ),
+        ];
+        for (project, text) in rows {
+            store
+                .enqueue_pending_extraction(project, "Bash", text)
+                .unwrap();
+        }
+        let pending = store.list_pending_extractions(10).unwrap();
+        assert_eq!(pending.len(), 4);
+        let groups = group_pending_by_project(&pending);
+        assert_eq!(groups.len(), 4);
+
+        let provider = ScriptedProvider {
+            calls: Cell::new(0),
+        };
+        let mut tally = DrainTally::default();
+        drain_pending_groups(
+            &store,
+            Some(&StubEmbedder),
+            &provider,
+            None,
+            256,
+            std::time::Duration::from_secs(5),
+            &groups,
+            &mut tally,
+        )
+        .unwrap();
+
+        // alpha: the real bullet is filed under alpha, `(none)` is skipped.
+        let alpha = store.get_by_topic("context-alpha").unwrap();
+        assert_eq!(alpha.len(), 1);
+        assert!(alpha[0].summary.contains("PostgreSQL"));
+        // beta: empty output drops the row and is counted, nothing stored.
+        assert!(store.get_by_topic("context-beta").unwrap().is_empty());
+        assert_eq!(tally.discarded_rows, 1);
+        // gamma failed; delta never reached the provider (latched) and both
+        // took the local extractor under their own topics.
+        assert_eq!(
+            provider.calls.get(),
+            3,
+            "the provider must not be called again after a runtime failure"
+        );
+        assert_eq!(tally.fallback_rows, 2);
+        assert!(!store.get_by_topic("context-gamma").unwrap().is_empty());
+        assert!(!store.get_by_topic("context-delta").unwrap().is_empty());
+        // every row left the queue exactly once.
+        assert_eq!(tally.deleted, 4);
+        assert!(store.list_pending_extractions(10).unwrap().is_empty());
+        let line = tally.summary_line(4);
+        assert!(line.contains("2 via fastembed fallback"), "{line}");
+        assert!(
+            line.contains("1 dropped after empty provider output"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn drain_tally_summary_line_names_degraded_outcomes() {
+        let clean = DrainTally {
+            stored: 12,
+            deleted: 25,
+            ..DrainTally::default()
+        };
+        assert_eq!(
+            clean.summary_line(25),
+            "Processed 25 rows, extracted 12 facts, dequeued 25."
+        );
+
+        let degraded = DrainTally {
+            stored: 9,
+            deleted: 25,
+            fallback_rows: 3,
+            discarded_rows: 4,
+        };
+        let line = degraded.summary_line(25);
+        assert!(
+            line.contains("fastembed fallback"),
+            "operators grep for this phrase: {line}"
+        );
+        assert_eq!(
+            line,
+            "Processed 25 rows (3 via fastembed fallback, 4 dropped after empty provider output), \
+             extracted 9 facts, dequeued 25."
+        );
+    }
+
     /// Issue #186: `icm health` must expose `--summarizer-provider` to
     /// users it nudges toward consolidation, otherwise it's the source of
     /// the silent-degradation flow.
@@ -12046,6 +13154,135 @@ mod cli_contracts_tests {
         assert!(!compact);
         assert_eq!(http_proxy.as_deref(), Some("http://127.0.0.1:11435"));
         assert_eq!(token.as_deref(), Some("secret"));
+    }
+
+    /// Issue #179 regression test: `maybe_auto_consolidate` must only
+    /// enqueue a job once the topic actually exceeds the threshold — an
+    /// earlier draft enqueued unconditionally whenever an LLM summarizer
+    /// was configured, which would have queued a job on every single
+    /// `store()` call regardless of topic size.
+    #[test]
+    fn maybe_auto_consolidate_enqueues_only_over_threshold() {
+        let store = Store::in_memory_with_dims(64).unwrap();
+        let memory_cfg = crate::config::MemoryConfig {
+            auto_consolidate_enabled: true,
+            auto_consolidate_threshold: 3,
+            ..Default::default()
+        };
+        let mut consolidate_cfg = crate::config::ConsolidateConfig::default();
+        consolidate_cfg.summarizer.provider = "claude".to_string();
+
+        for i in 0..3 {
+            store
+                .store(Memory::new(
+                    "t".to_string(),
+                    format!("fact {i}"),
+                    Importance::Medium,
+                ))
+                .unwrap();
+        }
+
+        // At exactly the threshold — must not enqueue yet (same `> threshold`
+        // semantics as the pre-existing sync path).
+        maybe_auto_consolidate(&store, None, "t", &memory_cfg, &consolidate_cfg);
+        assert_eq!(
+            store.pending_consolidation_count().unwrap(),
+            0,
+            "must not enqueue at exactly the threshold"
+        );
+
+        store
+            .store(Memory::new(
+                "t".to_string(),
+                "fact 3".to_string(),
+                Importance::Medium,
+            ))
+            .unwrap();
+
+        // Now over threshold — must enqueue exactly one job.
+        maybe_auto_consolidate(&store, None, "t", &memory_cfg, &consolidate_cfg);
+        assert_eq!(store.pending_consolidation_count().unwrap(), 1);
+
+        let jobs = store.list_pending_consolidation_jobs(10).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].topic, "t");
+        assert_eq!(jobs[0].status, "pending");
+
+        // A second store() over an already-enqueued topic must not pile up
+        // duplicate jobs beyond what the drain will process — verifies the
+        // enqueue call itself is idempotent-friendly per invocation (each
+        // call adds one row; that's fine, the drain processes and marks
+        // them done rather than needing DB-level dedup).
+        maybe_auto_consolidate(&store, None, "t", &memory_cfg, &consolidate_cfg);
+        assert!(store.pending_consolidation_count().unwrap() >= 1);
+    }
+
+    /// End-to-end for issue #179: `cmd_consolidate_pending` must drain a
+    /// queued job, actually consolidate the topic (provider=none exercises
+    /// the lexical fallback so the test has no LLM CLI dependency), and
+    /// mark the job `done`. `cmd_consolidate_jobs` must then list it.
+    #[test]
+    fn consolidate_pending_drains_job_and_marks_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("memories.db");
+        let store = Store::with_dims(&db_path, 64).unwrap();
+
+        for i in 0..4 {
+            store
+                .store(Memory::new(
+                    "t".to_string(),
+                    format!("fact {i}"),
+                    Importance::Medium,
+                ))
+                .unwrap();
+        }
+        let job_id = store.enqueue_pending_consolidation("t", "").unwrap();
+
+        let cfg = config::SummarizerConfig::default(); // provider = "none" → lexical join
+        cmd_consolidate_pending(&store, None, &cfg, 10, None, None, false, &db_path).unwrap();
+
+        let jobs = store.list_consolidation_jobs(None, 10).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, job_id);
+        assert_eq!(jobs[0].status, "done");
+        assert!(jobs[0].completed_at.is_some());
+        assert!(store
+            .list_pending_consolidation_jobs(10)
+            .unwrap()
+            .is_empty());
+
+        // The topic itself must actually be consolidated (4 memories -> 1).
+        let remaining = store.get_by_topic("t").unwrap();
+        assert_eq!(remaining.len(), 1);
+    }
+
+    /// `cmd_consolidate_pending` on a job whose topic no longer has any
+    /// memories (e.g. it was manually consolidated/deleted between enqueue
+    /// and drain) must mark the job `failed` with a captured error rather
+    /// than panicking or silently dropping the job.
+    #[test]
+    fn consolidate_pending_marks_failed_job_with_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("memories.db");
+        let store = Store::with_dims(&db_path, 64).unwrap();
+
+        let job_id = store
+            .enqueue_pending_consolidation("does-not-exist", "")
+            .unwrap();
+
+        let cfg = config::SummarizerConfig::default();
+        cmd_consolidate_pending(&store, None, &cfg, 10, None, None, false, &db_path).unwrap();
+
+        let jobs = store.list_consolidation_jobs(Some("failed"), 10).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, job_id);
+        assert!(jobs[0].error.is_some());
+
+        // `icm consolidate-jobs --retry <id>` must reset it back to pending.
+        cmd_consolidate_jobs(&store, None, 10, Some(&job_id)).unwrap();
+        let jobs = store.list_consolidation_jobs(Some("pending"), 10).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, job_id);
     }
 }
 
@@ -12633,11 +13870,13 @@ mod cmd_remember_tests {
         use icm_store::Store;
         let store = Store::in_memory().unwrap();
         let cfg = crate::config::MemoryConfig::default();
+        let consolidate_cfg = crate::config::ConsolidateConfig::default();
 
         cmd_store(
             &store,
             None,
             &cfg,
+            &consolidate_cfg,
             "icm".into(),
             "TODO: wire FTS5 trigger for memory updates".into(),
             Importance::Medium,
@@ -12650,6 +13889,7 @@ mod cmd_remember_tests {
             &store,
             None,
             &cfg,
+            &consolidate_cfg,
             "FTS5 trigger now syncs on update; closes the recall gap".into(),
             Some("icm".into()),
             Importance::Medium,
@@ -12663,6 +13903,25 @@ mod cmd_remember_tests {
         assert!(memories
             .iter()
             .any(|m| m.summary.contains("closes the recall gap")));
+    }
+}
+
+#[cfg(test)]
+mod cmd_recall_tests {
+    use super::*;
+
+    /// Audit finding (ported from the MCP `tool_recall` path): a
+    /// project/topic/keyword filter must not shrink the candidate pool the
+    /// store searches — only the final result count.
+    #[test]
+    fn recall_query_limit_widens_only_when_a_filter_is_active() {
+        assert_eq!(recall_query_limit(5, false), 5);
+        assert_eq!(recall_query_limit(5, true), 50);
+    }
+
+    #[test]
+    fn recall_query_limit_caps_at_200() {
+        assert_eq!(recall_query_limit(100, true), 200);
     }
 }
 

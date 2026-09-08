@@ -47,6 +47,7 @@
               # downloaded prebuilt (which wouldn't work in the sandbox).
               ORT_STRATEGY = "system";
               ORT_LIB_LOCATION = "${pkgs.lib.getLib pkgs.onnxruntime}/lib";
+              ORT_PREFER_DYNAMIC_LINK = "true";
             };
 
             # The test suite runs in CI via cargo; the sandboxed nix build
@@ -92,6 +93,7 @@
               OPENSSL_NO_VENDOR = "1";
               ORT_STRATEGY = "system";
               ORT_LIB_LOCATION = "${pkgs.lib.getLib pkgs.onnxruntime}/lib";
+              ORT_PREFER_DYNAMIC_LINK = "true";
             };
           };
         }

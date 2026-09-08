@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use directories::ProjectDirs;
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
@@ -104,64 +104,67 @@ fn onnxruntime_dylib_available() -> bool {
 }
 
 pub struct FastEmbedder {
-    model: OnceLock<TextEmbedding>,
-    init_lock: Mutex<()>,
+    // fastembed 6's `TextEmbedding::embed` takes `&mut self`; a single
+    // mutex both lazily initializes the model on first use and serializes
+    // the `&mut` access `embed`/`embed_query`/`embed_batch` need, while
+    // `Embedder`'s trait methods stay `&self` (matches every other
+    // `MemoryStore`-adjacent trait in this codebase, which assumes a
+    // shared, thread-safe embedder).
+    model: Mutex<Option<TextEmbedding>>,
     model_name: String,
     dims: usize,
 }
 
-/// Default model: multilingual-e5-small (384d, supports 100+ languages)
-const DEFAULT_MODEL: &str = "intfloat/multilingual-e5-base";
+/// Default model: multilingual-e5-large (1024d). Unlike -small/-base,
+/// fastembed's `model_code` for the large variant is the Qdrant ONNX
+/// conversion, not an `intfloat/...` path — confirmed via
+/// `TextEmbedding::list_supported_models()` (and matches the existing
+/// `e5_models_use_instruction_prefixes` test, which already covers this
+/// exact string). Using `intfloat/multilingual-e5-large` here silently
+/// failed every embed call (`resolve_model` returned `Unknown embedding
+/// model`), degrading every store to no-embedding and every recall to the
+/// FTS/keyword fallback — caught by a 0.0% LoCoMo pilot recall@5 that had
+/// no business being that low.
+///
+/// LoCoMo benchmark pilot (2026-08-29, conv-26, 419 turns, 28 questions,
+/// evidence recall@5): multilingual-e5-**base** (768d) scored 56.2%;
+/// swapping to BAAI/bge-m3 (1024d, MTEB-competitive, but tuned for
+/// long-document retrieval with an 8192-token context) *regressed* to
+/// 50.9% on this short-dialogue-turn workload — a higher general
+/// leaderboard rank didn't transfer to this task. e5-large is the same
+/// architecture/training recipe that already measured well, one size up.
+///
+/// `pub` and re-exported so `icm-cli`'s `EmbeddingsConfig::default()` can
+/// reference this instead of duplicating the string: the two used to drift
+/// (config.rs hardcoded its own default and kept pointing at the previous
+/// choice after this constant changed, so nothing here actually took
+/// effect for a real `icm store`/`icm recall` run until config.rs was
+/// fixed too).
+pub const DEFAULT_MODEL: &str = "Qdrant/multilingual-e5-large-onnx";
 
-/// Resolve a model string to (EmbeddingModel, dimensions).
+/// Resolve a model string (e.g. `"intfloat/multilingual-e5-base"`,
+/// `"BAAI/bge-m3"`) to (EmbeddingModel, dimensions).
+///
+/// Deliberately not `str::parse::<EmbeddingModel>()`: fastembed 6 changed
+/// `FromStr` to match the enum variant's `Debug` representation
+/// (`"MultilingualE5Large"`) instead of its HuggingFace-style `model_code`
+/// (`"Qdrant/multilingual-e5-large-onnx"`, still what `ModelInfo` and every
+/// fastembed doc/example use for display) — silently breaking every
+/// HuggingFace-style name this codebase's config, CLI docs and tests use
+/// (caught by `e5_models_use_instruction_prefixes` failing on the v4→v6
+/// bump). Look up by `model_code` directly via `list_supported_models`
+/// instead, so those names keep working regardless of how fastembed's own
+/// `FromStr` behaves release to release.
 fn resolve_model(name: &str) -> IcmResult<(EmbeddingModel, usize)> {
-    let model: EmbeddingModel = name.parse().map_err(|e: String| IcmError::Embedding(e))?;
-    let dims = model_dimensions(&model);
-    Ok((model, dims))
-}
-
-/// Known dimensions for fastembed models.
-fn model_dimensions(model: &EmbeddingModel) -> usize {
-    match model {
-        EmbeddingModel::AllMiniLML6V2
-        | EmbeddingModel::AllMiniLML6V2Q
-        | EmbeddingModel::AllMiniLML12V2
-        | EmbeddingModel::AllMiniLML12V2Q
-        | EmbeddingModel::BGESmallENV15
-        | EmbeddingModel::BGESmallENV15Q
-        | EmbeddingModel::MultilingualE5Small
-        | EmbeddingModel::ParaphraseMLMiniLML12V2
-        | EmbeddingModel::ParaphraseMLMiniLML12V2Q => 384,
-
-        EmbeddingModel::BGEBaseENV15
-        | EmbeddingModel::BGEBaseENV15Q
-        | EmbeddingModel::MultilingualE5Base
-        | EmbeddingModel::ParaphraseMLMpnetBaseV2
-        | EmbeddingModel::BGESmallZHV15
-        | EmbeddingModel::GTEBaseENV15
-        | EmbeddingModel::GTEBaseENV15Q
-        | EmbeddingModel::JinaEmbeddingsV2BaseCode => 768,
-
-        EmbeddingModel::BGELargeENV15
-        | EmbeddingModel::BGELargeENV15Q
-        | EmbeddingModel::MultilingualE5Large
-        | EmbeddingModel::MxbaiEmbedLargeV1
-        | EmbeddingModel::MxbaiEmbedLargeV1Q
-        | EmbeddingModel::BGELargeZHV15
-        | EmbeddingModel::GTELargeENV15
-        | EmbeddingModel::GTELargeENV15Q
-        | EmbeddingModel::ModernBertEmbedLarge => 1024,
-
-        EmbeddingModel::NomicEmbedTextV1
-        | EmbeddingModel::NomicEmbedTextV15
-        | EmbeddingModel::NomicEmbedTextV15Q => 768,
-
-        EmbeddingModel::ClipVitB32 => 512,
-    }
+    TextEmbedding::list_supported_models()
+        .into_iter()
+        .find(|info| info.model_code.eq_ignore_ascii_case(name))
+        .map(|info| (info.model, info.dim))
+        .ok_or_else(|| IcmError::Embedding(format!("Unknown embedding model: {name}")))
 }
 
 impl FastEmbedder {
-    /// Create with default model (multilingual-e5-small).
+    /// Create with the default model (see `DEFAULT_MODEL`).
     pub fn new() -> Self {
         Self::with_model(DEFAULT_MODEL)
     }
@@ -170,50 +173,51 @@ impl FastEmbedder {
     pub fn with_model(model_name: &str) -> Self {
         let dims = resolve_model(model_name).map(|(_, d)| d).unwrap_or(384);
         Self {
-            model: OnceLock::new(),
-            init_lock: Mutex::new(()),
+            model: Mutex::new(None),
             model_name: model_name.to_string(),
             dims,
         }
     }
 
-    fn get_model(&self) -> IcmResult<&TextEmbedding> {
-        if let Some(m) = self.model.get() {
-            return Ok(m);
+    /// Run `f` against the lazily-initialized model, holding the lock for
+    /// the duration of the call (fastembed 6's `embed` needs `&mut self`).
+    fn with_loaded_model<R>(
+        &self,
+        f: impl FnOnce(&mut TextEmbedding) -> IcmResult<R>,
+    ) -> IcmResult<R> {
+        let mut guard = self.model.lock().unwrap();
+        if guard.is_none() {
+            let (emb_model, _) = resolve_model(&self.model_name)?;
+            let cache = cache_dir();
+            std::fs::create_dir_all(&cache)
+                .and_then(|()| cachedir::ensure_tag(&cache))
+                .unwrap_or_else(|e| tracing::warn!("could not tag cache dir: {e}"));
+            // With the load-dynamic ort backend (issue #345) onnxruntime is
+            // resolved at runtime. If it's absent, ort *panics* inside init —
+            // and since the release profile is `panic = "abort"`, that would
+            // kill the process rather than unwind (so catch_unwind can't
+            // help). Pre-flight the dylib instead: if it can't be dlopen'd,
+            // return a clean error (→ keyword-only search) before ort ever
+            // initializes. Static builds link onnxruntime in, so this check
+            // is compiled out there.
+            #[cfg(feature = "embeddings-dynamic")]
+            if !onnxruntime_dylib_available() {
+                return Err(IcmError::Embedding(
+                    "onnxruntime runtime not found for this load-dynamic build; \
+                     install onnxruntime (or set ORT_DYLIB_PATH), or run with \
+                     --no-embeddings for keyword-only search"
+                        .to_string(),
+                ));
+            }
+            let model = TextEmbedding::try_new(
+                InitOptions::new(emb_model)
+                    .with_show_download_progress(true)
+                    .with_cache_dir(cache),
+            )
+            .map_err(|e| IcmError::Embedding(format!("failed to init model: {e}")))?;
+            *guard = Some(model);
         }
-        let _guard = self.init_lock.lock().unwrap();
-        if let Some(m) = self.model.get() {
-            return Ok(m);
-        }
-        let (emb_model, _) = resolve_model(&self.model_name)?;
-        let cache = cache_dir();
-        std::fs::create_dir_all(&cache)
-            .and_then(|()| cachedir::ensure_tag(&cache))
-            .unwrap_or_else(|e| tracing::warn!("could not tag cache dir: {e}"));
-        // With the load-dynamic ort backend (issue #345) onnxruntime is resolved
-        // at runtime. If it's absent, ort *panics* inside init — and since the
-        // release profile is `panic = "abort"`, that would kill the process
-        // rather than unwind (so catch_unwind can't help). Pre-flight the dylib
-        // instead: if it can't be dlopen'd, return a clean error (→ keyword-only
-        // search) before ort ever initializes. Static builds link onnxruntime
-        // in, so this check is compiled out there.
-        #[cfg(feature = "embeddings-dynamic")]
-        if !onnxruntime_dylib_available() {
-            return Err(IcmError::Embedding(
-                "onnxruntime runtime not found for this load-dynamic build; \
-                 install onnxruntime (or set ORT_DYLIB_PATH), or run with \
-                 --no-embeddings for keyword-only search"
-                    .to_string(),
-            ));
-        }
-        let model = TextEmbedding::try_new(
-            InitOptions::new(emb_model)
-                .with_show_download_progress(true)
-                .with_cache_dir(cache),
-        )
-        .map_err(|e| IcmError::Embedding(format!("failed to init model: {e}")))?;
-        let _ = self.model.set(model);
-        Ok(self.model.get().unwrap())
+        f(guard.as_mut().unwrap())
     }
 
     /// e5-family instruction prefixes as `(query_prefix, passage_prefix)`.
@@ -236,7 +240,6 @@ impl FastEmbedder {
 
     /// Embed a single text, optionally prepending an instruction `prefix`.
     fn embed_one(&self, prefix: &str, text: &str) -> IcmResult<Vec<f32>> {
-        let model = self.get_model()?;
         let prefixed: String;
         let input: &str = if prefix.is_empty() {
             text
@@ -244,13 +247,15 @@ impl FastEmbedder {
             prefixed = format!("{prefix}{text}");
             &prefixed
         };
-        let results = model
-            .embed(vec![input], None)
-            .map_err(|e| IcmError::Embedding(e.to_string()))?;
-        results
-            .into_iter()
-            .next()
-            .ok_or_else(|| IcmError::Embedding("empty embedding result".into()))
+        self.with_loaded_model(|model| {
+            let results = model
+                .embed(vec![input], None)
+                .map_err(|e| IcmError::Embedding(e.to_string()))?;
+            results
+                .into_iter()
+                .next()
+                .ok_or_else(|| IcmError::Embedding("empty embedding result".into()))
+        })
     }
 }
 
@@ -277,18 +282,19 @@ impl Embedder for FastEmbedder {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        let model = self.get_model()?;
         let (_, passage) = self.instruction_prefixes();
-        if passage.is_empty() {
-            model
-                .embed(texts.to_vec(), None)
-                .map_err(|e| IcmError::Embedding(e.to_string()))
-        } else {
-            let prefixed: Vec<String> = texts.iter().map(|t| format!("{passage}{t}")).collect();
-            model
-                .embed(prefixed, None)
-                .map_err(|e| IcmError::Embedding(e.to_string()))
-        }
+        self.with_loaded_model(|model| {
+            if passage.is_empty() {
+                model
+                    .embed(texts, None)
+                    .map_err(|e| IcmError::Embedding(e.to_string()))
+            } else {
+                let prefixed: Vec<String> = texts.iter().map(|t| format!("{passage}{t}")).collect();
+                model
+                    .embed(prefixed, None)
+                    .map_err(|e| IcmError::Embedding(e.to_string()))
+            }
+        })
     }
 
     fn dimensions(&self) -> usize {
