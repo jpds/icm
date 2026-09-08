@@ -41,6 +41,8 @@ chrono = { version = "0.4", features = ["serde"] }
 ulid = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Project detection (git remote / worktree resolution)
+gix = { version = "0.87.1", default-features = false, features = ["revision", "sha1"] }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
