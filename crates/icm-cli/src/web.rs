@@ -4,13 +4,13 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use axum::{
+    Router,
     body::Body,
     extract::{Path, Query, State},
-    http::{header, Method, Request, StatusCode},
+    http::{Method, Request, StatusCode, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Json, Response},
     routing::{delete, get, post},
-    Router,
 };
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
@@ -537,7 +537,7 @@ async fn api_topic_consolidate(
                 ok: false,
                 message: e.to_string(),
             })
-            .into_response()
+            .into_response();
         }
     };
 

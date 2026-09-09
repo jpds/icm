@@ -1,12 +1,12 @@
 use chrono::Utc;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use icm_core::{
-    add_backrefs, auto_link_memory, build_wake_up, find_similar_memory, format_local,
-    is_preference_topic, keyword_matches, project_matches, topic_matches, AutoLinkOptions, Concept,
-    ConceptLink, Embedder, Feedback, FeedbackStore, Label, Memoir, MemoirStore, Memory,
-    MemoryStore, Relation, WakeUpFormat, WakeUpOptions, DEDUP_SIMILARITY_THRESHOLD,
-    MSG_NO_MEMORIES,
+    AutoLinkOptions, Concept, ConceptLink, DEDUP_SIMILARITY_THRESHOLD, Embedder, Feedback,
+    FeedbackStore, Label, MSG_NO_MEMORIES, Memoir, MemoirStore, Memory, MemoryStore, Relation,
+    WakeUpFormat, WakeUpOptions, add_backrefs, auto_link_memory, build_wake_up,
+    find_similar_memory, format_local, is_preference_topic, keyword_matches, project_matches,
+    topic_matches,
 };
 use icm_store::Store;
 
@@ -853,7 +853,7 @@ fn tool_transcript_record(store: &Store, args: &Value) -> ToolResult {
         None => {
             return ToolResult::error(format!(
                 "invalid role '{role_str}'; must be user|assistant|system|tool"
-            ))
+            ));
         }
     };
     let content = match args.get("content").and_then(|v| v.as_str()) {
@@ -2453,7 +2453,9 @@ fn tool_feedback_record(
             if compact {
                 ToolResult::text(format!("ok {id}"))
             } else {
-                ToolResult::text(format!("Feedback recorded: {id}\n  topic: {topic}\n  predicted: {predicted}\n  corrected: {corrected}"))
+                ToolResult::text(format!(
+                    "Feedback recorded: {id}\n  topic: {topic}\n  predicted: {predicted}\n  corrected: {corrected}"
+                ))
             }
         }
         Err(e) => ToolResult::error(format!("failed to store feedback: {e}")),
@@ -3139,9 +3141,11 @@ mod tests {
             false,
         );
         assert!(result.is_error);
-        assert!(result.content[0]
-            .text
-            .contains("content exceeds maximum length"));
+        assert!(
+            result.content[0]
+                .text
+                .contains("content exceeds maximum length")
+        );
     }
 
     #[test]
@@ -3839,9 +3843,11 @@ mod tests {
             false,
         );
         assert!(result.is_error);
-        assert!(result.content[0]
-            .text
-            .contains("topic exceeds maximum length"));
+        assert!(
+            result.content[0]
+                .text
+                .contains("topic exceeds maximum length")
+        );
     }
 
     #[test]
@@ -3856,9 +3862,11 @@ mod tests {
             false,
         );
         assert!(result.is_error);
-        assert!(result.content[0]
-            .text
-            .contains("content exceeds maximum length"));
+        assert!(
+            result.content[0]
+                .text
+                .contains("content exceeds maximum length")
+        );
     }
 
     #[test]

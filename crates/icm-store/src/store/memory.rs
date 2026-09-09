@@ -377,8 +377,7 @@ impl MemoryStore for SqliteStore {
         let sanitized = sanitize_fts_query_any(query);
 
         // 1. Get FTS results with rank scores
-        let fts_sql =
-            "SELECT m.id, m.created_at, m.updated_at, m.last_accessed, m.access_count, m.weight, \
+        let fts_sql = "SELECT m.id, m.created_at, m.updated_at, m.last_accessed, m.access_count, m.weight, \
                     m.topic, m.summary, m.raw_excerpt, m.keywords, \
                     m.importance, m.source_type, m.source_data, m.related_ids, m.embedding, \
                     fts.rank \
