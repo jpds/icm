@@ -571,7 +571,8 @@ mod tests {
         .map(|k| (*k, std::env::var(k).ok()))
         .collect();
         for (k, _) in &snapshot {
-            std::env::remove_var(k);
+            // SAFETY: single-threaded test; env is snapshotted/restored here.
+            unsafe { std::env::remove_var(k) };
         }
 
         let result = detect_provider(ProviderKind::Auto);
@@ -579,7 +580,8 @@ mod tests {
         // Restore env before asserting so failures don't poison later tests.
         for (k, v) in snapshot {
             if let Some(val) = v {
-                std::env::set_var(k, val);
+                // SAFETY: single-threaded test; env is snapshotted/restored here.
+                unsafe { std::env::set_var(k, val) };
             }
         }
 
@@ -608,12 +610,13 @@ mod tests {
     fn detect_honors_explicit_invoker_env() {
         // Save then override.
         let prior = std::env::var("ICM_INVOKER").ok();
-        std::env::set_var("ICM_INVOKER", "ollama");
+        // SAFETY: single-threaded test; env is snapshotted/restored here.
+        unsafe { std::env::set_var("ICM_INVOKER", "ollama") };
         let got = detect_provider(ProviderKind::Claude);
         if let Some(v) = prior {
-            std::env::set_var("ICM_INVOKER", v);
+            unsafe { std::env::set_var("ICM_INVOKER", v) };
         } else {
-            std::env::remove_var("ICM_INVOKER");
+            unsafe { std::env::remove_var("ICM_INVOKER") };
         }
         assert_eq!(got, ProviderKind::Ollama);
     }

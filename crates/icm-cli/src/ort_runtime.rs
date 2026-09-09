@@ -137,7 +137,8 @@ pub fn activate_if_present() -> bool {
     }
     if let Some(lib) = managed_lib_path() {
         if lib.is_file() {
-            std::env::set_var(ORT_DYLIB_ENV, &lib);
+            // SAFETY: single-threaded startup path, before any threads spawn.
+            unsafe { std::env::set_var(ORT_DYLIB_ENV, &lib) };
             return true;
         }
     }
@@ -330,7 +331,8 @@ pub fn download(progress: bool) -> Result<PathBuf> {
     if let Some(marker) = declined_marker() {
         let _ = std::fs::remove_file(marker);
     }
-    std::env::set_var(ORT_DYLIB_ENV, &lib_path);
+    // SAFETY: single-threaded startup path, before any threads spawn.
+    unsafe { std::env::set_var(ORT_DYLIB_ENV, &lib_path) };
     if progress {
         eprintln!(
             "Installed onnxruntime {ORT_VERSION} → {}",

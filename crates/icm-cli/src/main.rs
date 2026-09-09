@@ -12056,14 +12056,16 @@ mod read_only_requested_tests {
     fn with_env<F: FnOnce()>(value: Option<&str>, body: F) {
         let _g = ENV_LOCK.lock().unwrap();
         let prev = std::env::var("ICM_READONLY").ok();
+        // SAFETY: `ENV_LOCK` serializes all env mutation in tests, so no other
+        // thread observes the intermediate state.
         match value {
-            Some(v) => std::env::set_var("ICM_READONLY", v),
-            None => std::env::remove_var("ICM_READONLY"),
+            Some(v) => unsafe { std::env::set_var("ICM_READONLY", v) },
+            None => unsafe { std::env::remove_var("ICM_READONLY") },
         }
         body();
         match prev {
-            Some(v) => std::env::set_var("ICM_READONLY", v),
-            None => std::env::remove_var("ICM_READONLY"),
+            Some(v) => unsafe { std::env::set_var("ICM_READONLY", v) },
+            None => unsafe { std::env::remove_var("ICM_READONLY") },
         }
     }
 
@@ -12116,7 +12118,9 @@ mod resolve_db_path_tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let prev_cwd = std::env::current_dir().unwrap();
         let prev_icm_db = std::env::var("ICM_DB").ok();
-        std::env::remove_var("ICM_DB");
+        // SAFETY: `ENV_LOCK` serializes all cwd/env mutation in tests, so no
+        // other thread observes the intermediate state.
+        unsafe { std::env::remove_var("ICM_DB") };
 
         let dir = tempfile::tempdir().unwrap();
         // macOS: /tmp (and TMPDIR) is a symlink into /private/tmp — the
@@ -12131,15 +12135,15 @@ mod resolve_db_path_tests {
 
         std::env::set_current_dir(prev_cwd).unwrap();
         match prev_icm_db {
-            Some(v) => std::env::set_var("ICM_DB", v),
-            None => std::env::remove_var("ICM_DB"),
+            Some(v) => unsafe { std::env::set_var("ICM_DB", v) },
+            None => unsafe { std::env::remove_var("ICM_DB") },
         }
     }
 
     #[test]
     fn cli_flag_wins_over_everything() {
         with_isolated_cwd(|_| {
-            std::env::set_var("ICM_DB", "/should/not/win");
+            unsafe { std::env::set_var("ICM_DB", "/should/not/win") };
             let cfg = config::Config::default();
             let resolved = resolve_db_path(Some(PathBuf::from("/explicit/flag.db")), &cfg);
             assert_eq!(resolved, PathBuf::from("/explicit/flag.db"));
@@ -12149,7 +12153,7 @@ mod resolve_db_path_tests {
     #[test]
     fn env_var_wins_when_no_flag() {
         with_isolated_cwd(|_| {
-            std::env::set_var("ICM_DB", "/from/env.db");
+            unsafe { std::env::set_var("ICM_DB", "/from/env.db") };
             let cfg = config::Config::default();
             let resolved = resolve_db_path(None, &cfg);
             assert_eq!(resolved, PathBuf::from("/from/env.db"));
@@ -12268,7 +12272,7 @@ mod cli_config_dir_tests {
     fn falls_back_to_home_when_env_unset() {
         // Use a uniquely-named env var so we don't race with a real one.
         let var = "ICM_TEST_FAKE_ENV_VAR_THAT_DOES_NOT_EXIST";
-        std::env::remove_var(var);
+        unsafe { std::env::remove_var(var) };
         let dir = cli_config_dir(var, ".faketool", "/home/u");
         assert_eq!(dir, PathBuf::from("/home/u/.faketool"));
     }
@@ -12276,9 +12280,9 @@ mod cli_config_dir_tests {
     #[test]
     fn uses_env_var_when_set() {
         let var = "ICM_TEST_CLI_CONFIG_DIR_OVERRIDE";
-        std::env::set_var(var, "/tmp/custom-cli-home");
+        unsafe { std::env::set_var(var, "/tmp/custom-cli-home") };
         let dir = cli_config_dir(var, ".faketool", "/home/u");
-        std::env::remove_var(var);
+        unsafe { std::env::remove_var(var) };
         assert_eq!(dir, PathBuf::from("/tmp/custom-cli-home"));
     }
 
@@ -12286,9 +12290,9 @@ mod cli_config_dir_tests {
     fn empty_env_var_falls_back_to_home() {
         // An accidentally-empty `export FOO=` should not produce a useless empty path.
         let var = "ICM_TEST_CLI_CONFIG_DIR_EMPTY";
-        std::env::set_var(var, "");
+        unsafe { std::env::set_var(var, "") };
         let dir = cli_config_dir(var, ".faketool", "/home/u");
-        std::env::remove_var(var);
+        unsafe { std::env::remove_var(var) };
         assert_eq!(dir, PathBuf::from("/home/u/.faketool"));
     }
 }
