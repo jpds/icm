@@ -568,10 +568,10 @@ async fn handle_store(
     if let Some(raw) = req.raw.as_deref().filter(|s| !s.is_empty()) {
         mem.raw_excerpt = Some(raw.to_string());
     }
-    if let Some(emb) = state.embedder_ref() {
-        if let Ok(v) = emb.embed(&format!("{} {}", mem.topic, mem.summary)) {
-            mem.embedding = Some(v);
-        }
+    if let Some(emb) = state.embedder_ref()
+        && let Ok(v) = emb.embed(&format!("{} {}", mem.topic, mem.summary))
+    {
+        mem.embedding = Some(v);
     }
 
     let outcome = lock_store(&state).store(mem.clone());
@@ -660,10 +660,10 @@ async fn handle_consolidate(
     // Same bug class as #400 (cmd_consolidate/tool_consolidate): this is a
     // third, independent /consolidate implementation that had the same gap
     // — never attached an embedding to the merged memory it creates.
-    if let Some(emb) = state.embedder_ref() {
-        if let Ok(v) = emb.embed(&consolidated.embed_text()) {
-            consolidated.embedding = Some(v);
-        }
+    if let Some(emb) = state.embedder_ref()
+        && let Ok(v) = emb.embed(&consolidated.embed_text())
+    {
+        consolidated.embedding = Some(v);
     }
 
     let result = if req.keep_originals {

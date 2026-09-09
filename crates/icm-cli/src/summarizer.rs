@@ -59,12 +59,11 @@ impl ProviderKind {
 /// left by the invoking tool. Falls back to the configured `fallback` when
 /// no hint matches.
 pub fn detect_provider(fallback: ProviderKind) -> ProviderKind {
-    if let Ok(forced) = std::env::var("ICM_INVOKER") {
-        if let Ok(p) = ProviderKind::parse(&forced) {
-            if p != ProviderKind::Auto {
-                return p;
-            }
-        }
+    if let Ok(forced) = std::env::var("ICM_INVOKER")
+        && let Ok(p) = ProviderKind::parse(&forced)
+        && p != ProviderKind::Auto
+    {
+        return p;
     }
     if std::env::var("CLAUDECODE").is_ok() || std::env::var("CLAUDE_CLI").is_ok() {
         return ProviderKind::Claude;
